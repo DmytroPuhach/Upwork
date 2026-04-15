@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { 
+      width: 380px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 13px; color: #1a1a1a; background: #fff; padding: 16px;
+    }
+    .header { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; }
+    .header h1 { font-size: 15px; font-weight: 600; }
+    .header .badge { font-size: 10px; background: #10B981; color: white; padding: 2px 6px; border-radius: 10px; }
+    .header .badge.off { background: #EF4444; }
+    
+    .status-card { background: #F3F4F6; border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+    .status-row { display: flex; justify-content: space-between; margin-bottom: 4px; }
+    .status-row:last-child { margin-bottom: 0; }
+    .status-label { color: #6B7280; }
+    .status-value { font-weight: 500; }
+    .status-value.ok { color: #10B981; }
+    .status-value.err { color: #EF4444; }
+    
+    .section { margin-bottom: 16px; }
+    .section-title { font-size: 12px; font-weight: 600; color: #6B7280; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+    
+    label { display: block; font-size: 12px; color: #374151; margin-bottom: 4px; }
+    input, select { 
+      width: 100%; padding: 8px 10px; border: 1px solid #D1D5DB; border-radius: 6px;
+      font-size: 12px; margin-bottom: 8px; outline: none; font-family: monospace;
+    }
+    input:focus { border-color: #3B82F6; }
+    
+    .btn { 
+      width: 100%; padding: 10px; border: none; border-radius: 6px; cursor: pointer;
+      font-size: 13px; font-weight: 500; 
+    }
+    .btn-primary { background: #3B82F6; color: white; }
+    .btn-primary:hover { background: #2563EB; }
+    .btn-secondary { background: #F3F4F6; color: #374151; margin-top: 6px; }
+    .btn-secondary:hover { background: #E5E7EB; }
+    .btn-danger { background: #FEE2E2; color: #DC2626; margin-top: 6px; }
+    
+    .actions { display: flex; gap: 6px; margin-top: 12px; }
+    .actions .btn { flex: 1; }
+    
+    .toast { display: none; padding: 8px 12px; background: #10B981; color: white; border-radius: 6px; text-align: center; margin-top: 8px; font-size: 12px; }
+    .toast.show { display: block; }
+    .toast.error { background: #EF4444; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>OptimizeUp Ecosystem</h1>
+    <span class="badge" id="statusBadge">...</span>
+  </div>
+
+  <div class="status-card" id="statusCard">
+    <div class="status-row">
+      <span class="status-label">Account</span>
+      <span class="status-value" id="stAccount">—</span>
+    </div>
+    <div class="status-row">
+      <span class="status-label">Supabase</span>
+      <span class="status-value" id="stSupabase">—</span>
+    </div>
+    <div class="status-row">
+      <span class="status-label">Telegram</span>
+      <span class="status-value" id="stTelegram">—</span>
+    </div>
+    <div class="status-row">
+      <span class="status-label">Opus API</span>
+      <span class="status-value" id="stOpus">—</span>
+    </div>
+    <div class="status-row">
+      <span class="status-label">RSS Polling</span>
+      <span class="status-value" id="stRss">—</span>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Configuration</div>
+    
+    <label>Account</label>
+    <select id="accountSlug">
+      <option value="dima">Dima</option>
+      <option value="david">David</option>
+      <option value="vasya">Vasya</option>
+      <option value="vika">Vika</option>
+    </select>
+
+    <label>Supabase Anon Key</label>
+    <input type="password" id="supabaseKey" placeholder="eyJhbGciOiJIUzI1NiIs...">
+
+    <label>Anthropic API Key</label>
+    <input type="password" id="anthropicKey" placeholder="sk-ant-...">
+
+    <label>Telegram Bot Token</label>
+    <input type="password" id="tgToken" placeholder="8796466253:AAE...">
+
+    <label>Telegram Chat ID</label>
+    <input type="text" id="tgChatId" placeholder="507827743">
+
+    <label>RSS Poll Interval (minutes)</label>
+    <input type="number" id="pollInterval" value="5" min="2" max="30">
+  </div>
+
+  <button class="btn btn-primary" id="saveBtn">Save & Activate</button>
+  
+  <div class="actions">
+    <button class="btn btn-secondary" id="pollBtn">Poll RSS Now</button>
+    <button class="btn btn-secondary" id="testTgBtn">Test TG</button>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
