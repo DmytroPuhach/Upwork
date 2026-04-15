@@ -33,8 +33,12 @@ async function setupAlarms() {
     periodInMinutes: 0.5
   });
   
-  console.log(`[BG] RSS polling set to every ${config.pollIntervalMinutes || 5} minutes`);
-  console.log(`[BG] Approved replies check every 30 seconds`);
+  // Check for new messages every 3 minutes
+  chrome.alarms.create('check-messages', {
+    periodInMinutes: 3
+  });
+  
+  console.log(`[BG] RSS polling every ${config.pollIntervalMinutes || 5}m, messages check every 3m`);
 }
 
 // ============================================
@@ -46,6 +50,9 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   }
   if (alarm.name === 'check-approved-replies') {
     await processApprovedReplies();
+  }
+  if (alarm.name === 'check-messages') {
+    await checkForNewMessages();
   }
 });
 
@@ -198,7 +205,129 @@ async function processJob(job, account, config) {
 }
 
 // ============================================
-// PROCESS APPROVED REPLIES — auto-send to Upwork
+// CHECK FOR NEW MESSAGES — scans messages tab for unread badges
+// ============================================
+const seenMessages = new Set(); // dedup across checks
+
+async function checkForNewMessages() {
+  try {
+    // Find any Upwork tab (messages or any page — we can check the nav badge)
+    const tabs = await chrome.tabs.query({ url: '*://www.upwork.com/*' });
+    if (!tabs.length) return;
+    
+    // First try to find messages tab
+    let msgTab = tabs.find(t => t.url?.includes('/messages'));
+    
+    // If no messages tab, use any Upwork tab to check unread count in nav
+    const targetTab = msgTab || tabs[0];
+    
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: targetTab.id },
+      func: () => {
+        const messages = [];
+        
+        // Method 1: Check nav badge for unread count
+        const navBadge = document.querySelector('a[href*="messages"] .badge, a[href*="messages"] [class*="count"], [data-test="nav-messages"] .badge');
+        const unreadCount = navBadge ? parseInt(navBadge.textContent) || 0 : 0;
+        
+        // Method 2: If we're on messages page, scan thread list for unread indicators
+        if (window.location.pathname.includes('/messages')) {
+          const threads = document.querySelectorAll('a[href*="/rooms/"]');
+          threads.forEach(thread => {
+            // Look for unread indicators — bold text, unread dot, badge
+            const isUnread = thread.querySelector('[class*="unread"], [class*="bold"], [class*="badge"]') 
+              || thread.closest('[class*="unread"]')
+              || (thread.querySelector('[class*="name"]')?.style?.fontWeight === 'bold');
+            
+            if (isUnread) {
+              const nameEl = thread.querySelector('[class*="name"], [class*="title"]');
+              const previewEl = thread.querySelector('[class*="preview"], [class*="last-message"], [class*="snippet"]');
+              const name = nameEl?.textContent?.trim() || '';
+              const preview = previewEl?.textContent?.trim() || '';
+              const href = thread.href || '';
+              
+              if (name && name.length > 2) {
+                messages.push({ name, preview: preview.substring(0, 200), url: href });
+              }
+            }
+          });
+          
+          // Method 3: Parse visible thread list text for message previews
+          if (messages.length === 0) {
+            const threadItems = document.querySelectorAll('[class*="thread-list"] > *, [class*="room-list"] > *');
+            threadItems.forEach(item => {
+              const text = item.textContent?.trim() || '';
+              const link = item.querySelector('a[href*="/rooms/"]');
+              // Check if item has visual unread indicator (usually bolder text or dot)
+              const style = window.getComputedStyle(item);
+              const isBold = style.fontWeight === '700' || style.fontWeight === 'bold';
+              
+              if (link && text.length > 10 && isBold) {
+                const parts = text.split('\n').filter(p => p.trim().length > 2);
+                messages.push({
+                  name: parts[0]?.trim() || 'Unknown',
+                  preview: parts.slice(1).join(' ').trim().substring(0, 200),
+                  url: link.href || ''
+                });
+              }
+            });
+          }
+        }
+        
+        return { unreadCount, messages, onMessagesPage: window.location.pathname.includes('/messages') };
+      }
+    });
+    
+    const data = results[0]?.result;
+    if (!data) return;
+    
+    console.log(`[MSG-CHECK] Unread: ${data.unreadCount}, Threads: ${data.messages?.length || 0}, On messages: ${data.onMessagesPage}`);
+    
+    // Process unread messages
+    if (data.messages?.length) {
+      for (const msg of data.messages) {
+        const key = `${msg.name}:${msg.preview.substring(0, 50)}`;
+        if (seenMessages.has(key)) continue;
+        seenMessages.add(key);
+        
+        // Keep set manageable
+        if (seenMessages.size > 200) {
+          const arr = [...seenMessages];
+          arr.splice(0, 100);
+          seenMessages.clear();
+          arr.forEach(k => seenMessages.add(k));
+        }
+        
+        console.log(`[MSG-CHECK] Unread from ${msg.name}: ${msg.preview.substring(0, 60)}`);
+        
+        // Process as new client message
+        await handleClientMessage({
+          clientName: msg.name.split(',')[0].trim(), // "Daniel Osafo, DO MARKETING" → "Daniel Osafo"
+          messageText: msg.preview || `New unread message from ${msg.name}`,
+          url: msg.url,
+          timestamp: new Date().toISOString()
+        });
+      }
+    } else if (data.unreadCount > 0 && !data.onMessagesPage) {
+      // We see unread badge but can't read messages — notify to open messages tab
+      const badgeKey = `badge:${data.unreadCount}:${new Date().getHours()}`;
+      if (!seenMessages.has(badgeKey)) {
+        seenMessages.add(badgeKey);
+        await sendTelegramAlert(`📩 <b>${data.unreadCount} unread message${data.unreadCount > 1 ? 's' : ''}</b> on Upwork!\n\nOpen messages tab for details.`, 
+          [{ text: '💬 Open Messages', url: 'https://www.upwork.com/ab/messages' }]);
+      }
+    }
+    
+  } catch (err) {
+    // Silent fail — tab might have navigated away
+    if (!String(err).includes('No tab') && !String(err).includes('Cannot access')) {
+      console.error('[MSG-CHECK] Error:', err);
+    }
+  }
+}
+
+// ============================================
+// PROCESS APPROVED REPLIES — auto-insert to Upwork
 // ============================================
 async function processApprovedReplies() {
   try {
