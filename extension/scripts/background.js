@@ -316,6 +316,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   
+  if (message.type === 'CHECK_PROPOSAL') {
+    checkProposalForJob(message.data.jobId).then(sendResponse);
+    return true;
+  }
+  
+  if (message.type === 'GET_LATEST_PROPOSAL') {
+    getLatestProposal().then(sendResponse);
+    return true;
+  }
+  
   if (message.type === 'GET_STATUS') {
     getStatus().then(sendResponse);
     return true;
@@ -532,6 +542,37 @@ async function getStatus() {
     };
   } catch (err) {
     return { configured: false, error: err.message };
+  }
+}
+
+async function checkProposalForJob(jobId) {
+  try {
+    const sb = await getSupabase();
+    // Find job by upwork_job_id
+    const jobs = await sb.query('jobs', { filters: { upwork_job_id: jobId }, limit: 1 });
+    if (!jobs.length) return { proposalText: null };
+    
+    // Find proposal for this job
+    const proposals = await sb.query('proposals', { filters: { job_id: jobs[0].id, status: 'generated' }, limit: 1 });
+    return { proposalText: proposals[0]?.proposal_text || null };
+  } catch (err) {
+    console.error('[BG] Check proposal error:', err);
+    return { proposalText: null };
+  }
+}
+
+async function getLatestProposal() {
+  try {
+    const sb = await getSupabase();
+    const proposals = await sb.query('proposals', { 
+      filters: { status: 'generated' },
+      limit: 1,
+      order: 'created_at.desc'
+    });
+    return { proposalText: proposals[0]?.proposal_text || null };
+  } catch (err) {
+    console.error('[BG] Get latest proposal error:', err);
+    return { proposalText: null };
   }
 }
 

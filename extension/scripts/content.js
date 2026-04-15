@@ -224,6 +224,10 @@
   function scrapeJobPage() {
     console.log('[OptimizeUp] On job page, ready for autofill');
     
+    // Extract job ID from URL
+    const urlMatch = window.location.href.match(/~(\d+)|_~(\d+)/);
+    const jobIdFromUrl = urlMatch?.[1] || urlMatch?.[2] || '';
+    
     // Listen for autofill command from background/popup
     chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (msg.type === 'AUTOFILL_PROPOSAL') {
@@ -231,6 +235,74 @@
         sendResponse({ ok: true });
       }
     });
+    
+    // Auto-check if we have a generated proposal for this job
+    if (jobIdFromUrl) {
+      checkForProposal(jobIdFromUrl);
+    }
+    
+    // Add floating "Fill Proposal" button
+    addAutofillButton();
+  }
+  
+  async function checkForProposal(jobId) {
+    try {
+      // Ask background to check Supabase for matching proposal
+      chrome.runtime.sendMessage({
+        type: 'CHECK_PROPOSAL',
+        data: { jobId }
+      }, (response) => {
+        if (response?.proposalText) {
+          console.log('[OptimizeUp] Found proposal for this job!');
+          showProposalReady(response.proposalText);
+        }
+      });
+    } catch (err) {
+      console.warn('[OptimizeUp] Could not check proposal:', err);
+    }
+  }
+  
+  function addAutofillButton() {
+    // Create floating button
+    const btn = document.createElement('div');
+    btn.id = 'optimizeup-autofill';
+    btn.innerHTML = `
+      <div style="position:fixed;bottom:20px;right:20px;z-index:99999;display:flex;flex-direction:column;gap:8px;align-items:flex-end;" id="ou-panel">
+        <div id="ou-status" style="display:none;background:#1a1a2e;color:#0f0;padding:10px 16px;border-radius:12px;font-size:13px;max-width:350px;box-shadow:0 4px 20px rgba(0,0,0,0.3);font-family:monospace;"></div>
+        <button id="ou-fill-btn" style="background:#10B981;color:white;border:none;padding:12px 20px;border-radius:12px;font-size:14px;font-weight:600;cursor:pointer;box-shadow:0 4px 15px rgba(16,185,129,0.4);display:flex;align-items:center;gap:8px;">
+          <span style="font-size:18px;">🚀</span> OptimizeUp Fill
+        </button>
+      </div>
+    `;
+    document.body.appendChild(btn);
+    
+    document.getElementById('ou-fill-btn').addEventListener('click', () => {
+      chrome.runtime.sendMessage({ type: 'GET_LATEST_PROPOSAL' }, (response) => {
+        if (response?.proposalText) {
+          autofillProposal(response.proposalText);
+          showStatus('✅ Proposal filled! Review and submit.');
+        } else {
+          showStatus('⚠️ No proposal found. Open extension popup or wait for next poll.');
+        }
+      });
+    });
+  }
+  
+  function showProposalReady(text) {
+    const status = document.getElementById('ou-status');
+    if (status) {
+      status.style.display = 'block';
+      status.innerHTML = `🤖 Proposal ready (${text.length} chars)<br><small>Click button to fill ↓</small>`;
+    }
+  }
+  
+  function showStatus(msg) {
+    const status = document.getElementById('ou-status');
+    if (status) {
+      status.style.display = 'block';
+      status.textContent = msg;
+      setTimeout(() => { status.style.display = 'none'; }, 5000);
+    }
   }
 
   function autofillProposal(text) {
