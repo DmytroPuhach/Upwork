@@ -247,12 +247,12 @@ async function processApprovedReplies() {
           continue;
         }
         
-        // Inject reply text into the message input
+        // Inject reply text into the message input (INSERT ONLY — no auto-click)
         const result = await chrome.scripting.executeScript({
           target: { tabId: targetTab.id },
           func: (text) => {
             // Find the message input area
-            const input = document.querySelector('textarea[class*="msg-composer"], textarea[name="message"], [contenteditable="true"][class*="msg"], [contenteditable="true"][class*="composer"], textarea[placeholder*="Send"]');
+            const input = document.querySelector('textarea[class*="msg-composer"], textarea[name="message"], [contenteditable="true"][class*="msg"], [contenteditable="true"][class*="composer"], textarea[placeholder*="Send"], textarea[class*="text-input"]');
             if (!input) return { ok: false, error: 'Input not found' };
             
             if (input.tagName === 'TEXTAREA') {
@@ -264,14 +264,7 @@ async function processApprovedReplies() {
               input.dispatchEvent(new Event('input', { bubbles: true }));
             }
             
-            // Try to find and click send button
-            const sendBtn = document.querySelector('button[class*="send"], button[type="submit"][class*="msg"], button[aria-label*="Send"]');
-            if (sendBtn && !sendBtn.disabled) {
-              // Don't auto-click send — let Dima confirm visually
-              return { ok: true, autoSent: false, message: 'Text inserted, ready to send' };
-            }
-            
-            return { ok: true, autoSent: false, message: 'Text inserted in input' };
+            return { ok: true, message: 'Text inserted — press Send manually' };
           },
           args: [replyText]
         });

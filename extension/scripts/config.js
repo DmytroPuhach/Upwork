@@ -27,7 +27,8 @@ export const DEFAULT_CONFIG = {
   // Feature flags
   enableRssPolling: true,
   enableMessageMonitoring: true,
-  enablePassiveScraping: true
+  enablePassiveScraping: true,
+  autoSendReplies: false // OFF by default — risky feature
 };
 
 export async function getConfig() {
