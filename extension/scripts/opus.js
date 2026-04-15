@@ -111,9 +111,13 @@ export async function generateProposal(job, accountSlug) {
   const systemPrompt = await getKnowledge('proposal_system_prompt');
   const account = await getAccountContext(accountSlug);
   const winners = await getWinners(account.id);
+  
+  // Load additional knowledge for better proposals
+  const winnerProposals = await getKnowledge('dima_winner_proposals');
+  const salesPatterns = await getKnowledge('dima_sales_patterns');
 
   const winnersContext = winners.length > 0
-    ? `\n\nWINNERS LOG (top proposals that got hired):\n${winners.map(w => 
+    ? `\n\nWINNERS LOG (proposals that got hired — learn from these):\n${winners.map(w => 
         `- Job: ${w.job_title}, Tone: ${w.tone}, Language: ${w.language}, Opening: "${w.opening_line}"`
       ).join('\n')}`
     : '\n\nNo winners log yet — use cases and portfolio for reference.';
@@ -145,7 +149,13 @@ Client country: ${job.client_country || 'Unknown'}
 Client rating: ${job.client_rating || 'New'}
 Skills: ${(job.skills || []).join(', ')}
 
-Generate the proposal. Pick 1-3 most relevant cases. Match language to client country (DE countries = German, else English). Use Pain→Solution→Benefit. First 230 chars must hook.`;
+Generate the proposal. Pick 1-3 most relevant cases. Match language to client country (DE countries = German, else English). Use Pain→Solution→Benefit. First 230 chars must hook.
+
+WINNING PROPOSAL PATTERNS (learn from these):
+${winnerProposals?.substring(0, 1500) || 'No winner data yet.'}
+
+SALES PATTERNS:
+${salesPatterns?.substring(0, 800) || 'No sales patterns yet.'}`;
 
   return callClaude(systemPrompt, userMessage);
 }
