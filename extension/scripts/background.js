@@ -626,26 +626,43 @@ async function handleScrapedJob(payload) {
 }
 
 function prerank(jobs, specialization) {
-  const kws = (specialization || [])
-    .map(s => String(s || '').toLowerCase().trim())
-    .filter(s => s.length >= 3);
+  // v17.1.0: specialization values are often multi-word phrases like
+  // "Technical SEO Architect" / "Shopify Liquid Optimization". Matching the
+  // whole phrase vs a job title rarely succeeds, so we split into meaningful
+  // tokens. Drop generic words that match everything.
+  const STOP = new Set(['seo', 'the', 'for', 'and', 'optimization', 'management',
+    'integration', 'expert', 'specialist']);
+  const tokens = new Set();
+  for (const phrase of (specialization || [])) {
+    const words = String(phrase || '').toLowerCase().split(/[\s\-\/,]+/).filter(Boolean);
+    for (const w of words) {
+      if (w.length >= 3 && !STOP.has(w)) tokens.add(w);
+    }
+  }
+  // Add the broad 'seo' token with low weight separately (most jobs will have it
+  // but it's still a useful positive signal vs non-SEO noise).
+  const kws = Array.from(tokens);
 
   if (kws.length === 0) return jobs.slice(0, 5);
 
   const scored = jobs.map(j => {
-    const hay = `${(j.title || '').toLowerCase()} ${(j.skills || []).join(' ').toLowerCase()}`;
+    const title = (j.title || '').toLowerCase();
+    const skills = (j.skills || []).join(' ').toLowerCase();
+    const hay = `${title} ${skills}`;
     let score = 0;
     for (const kw of kws) {
-      if (hay.includes(kw)) score += 2;
-      else {
-        const words = hay.split(/\W+/);
-        if (words.some(w => (w.startsWith(kw) && w.length >= kw.length) || (kw.startsWith(w) && w.length > 3))) score += 1;
-      }
+      if (title.includes(kw)) score += 3;        // title match = strong signal
+      else if (skills.includes(kw)) score += 2;  // skill chip match = medium
     }
+    // Broad SEO bonus (low weight) so SEO-adjacent jobs rank above pure dev/design
+    if (/\bseo\b|\baudit\b|\brank\b|\bgoogle\b/.test(title)) score += 1;
     return { job: j, score };
   });
   scored.sort((a, b) => b.score - a.score);
-  return scored.slice(0, 5).map(x => x.job);
+  // Only take scored items; if everything scored 0, fall back to first 5 by recency
+  const positive = scored.filter(x => x.score > 0);
+  const pool = positive.length > 0 ? positive : scored;
+  return pool.slice(0, 5).map(x => x.job);
 }
 
 async function handleJobsCandidates(payload) {
