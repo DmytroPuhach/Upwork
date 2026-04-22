@@ -1,6 +1,9 @@
 
-// OptimizeUp Extension v17.0.4 — Content Script
-// Enhanced dedup (Upwork job ID extraction), budget parsing, mutex, 3s debounce.
+// OptimizeUp Extension v17.1.0 — Content Script
+// v17.1.0: emits JOBS_CANDIDATES so background.js can pre-rank + enqueue top-N
+// for background-tab enrichment (full description / client stats). The legacy
+// JOB_SCRAPED path stays for DB-ingest (funnel tracking), but scoring is now
+// deferred until enrichment completes server-side.
 
 (function () {
   'use strict';
@@ -69,6 +72,17 @@
   }
 
   async function reportBroken(pageType, domSample) {
+    // v17.1.0 Fix C: Cloudflare challenge pages trigger a false 'broken' event
+    // for ~15-40 seconds. If we had a selector_success on this page_type in
+    // the last 5 minutes, suppress the broken alert entirely.
+    try {
+      const key = `ou_last_success_${pageType}`;
+      const last = parseInt(sessionStorage.getItem(key) || '0');
+      if (last && Date.now() - last < 5 * 60 * 1000) {
+        log(`⏭️ skip selector_broken alert (success ${Math.round((Date.now()-last)/1000)}s ago — likely Cloudflare)`);
+        return;
+      }
+    } catch {}
     await sendTelemetry('selector_broken', {
       selector_strategy: 'all_failed', detected_count: 0,
       dom_sample: domSample?.substring(0, 10000)
@@ -336,6 +350,21 @@
         for (const j of newJobs.slice(0, 10)) {
           chrome.runtime.sendMessage({ type: 'JOB_SCRAPED', payload: j }).catch(() => {});
         }
+        // v17.1.0: hand off candidates to background.js for enrichment pre-rank.
+        // Background picks top-N by title+skills match against the account's
+        // specialization and opens them in background tabs with human delays.
+        chrome.runtime.sendMessage({
+          type: 'JOBS_CANDIDATES',
+          payload: {
+            jobs: newJobs.map(j => ({
+              upwork_id: j.upwork_id,
+              url: j.url,
+              title: j.title,
+              skills: j.skills,
+            })),
+            source_url: location.href.substring(0, 300),
+          }
+        }).catch(() => {});
       }
     } finally {
       jobsInFlight = false;
@@ -356,12 +385,23 @@
     }, 3000);
   }
 
+  // v17.1.0: no observers on single-job pages (enrich.js runs there) or on
+  // irrelevant pages. Saves CPU and avoids stray JOB_SCRAPED emissions.
+  function shouldObserve() {
+    const pt = getPageType();
+    return pt === 'messages' || pt === 'jobs_search';
+  }
+
   const observer = new MutationObserver((mutations) => {
     const hasStructural = mutations.some(m => m.type === 'childList' && (m.addedNodes.length > 0 || m.removedNodes.length > 0));
     if (hasStructural) debouncedRun();
   });
 
   function startObserving() {
+    if (!shouldObserve()) {
+      log('⏭️ not observing this page type');
+      return;
+    }
     try {
       const target = document.querySelector('main') || document.body;
       if (target) {

@@ -1,12 +1,27 @@
-
-// OptimizeUp Extension v17.0.4 — Background Service Worker
-// NEW: auto-reload scheduler — pulls next_scrape_at from server, reloads Upwork tab
-// when it's time, respecting quiet_hours + min_interval + human-like jitter.
+// OptimizeUp Extension v17.1.0 — Background Service Worker
+// v17.1.0: Job enrichment worker — opens top candidates in background tabs,
+// extracts full description + client stats via injected enrich.js,
+// enforces human-like timing, hourly caps, and halts on login-redirect.
 
 const SB_URL = 'https://nsmcaexdqbipusjuzfht.supabase.co';
 const EXT_VERSION = chrome.runtime.getManifest().version;
 
 console.log('[OU] Background loaded — version', EXT_VERSION);
+
+// ═══════════════════════════════════════════════════════════
+// ENRICHMENT CONSTANTS — tuned for anti-ban
+// ═══════════════════════════════════════════════════════════
+
+const ENRICH_MAX_QUEUE = 50;                  // cap in-memory queue size
+const ENRICH_MAX_PER_HOUR = 5;                // hard rate cap
+const ENRICH_DELAY_WEIGHTS = [                // (weight, minMs, maxMs)
+  [0.40, 30000, 45000],    // 30-45s
+  [0.40, 45000, 75000],    // 45-75s
+  [0.20, 75000, 120000],   // 75-120s
+];
+const ENRICH_TAB_TIMEOUT_MS = 60000;          // force-close if stuck
+const ENRICH_MIN_INITIAL_WAIT_MS = 2500;      // after tab onUpdated complete
+const ENRICH_AUTH_HALT_MINUTES = 60;          // after auth_failure, halt this long
 
 // ═══════════════════════════════════════════════════════════
 // MACHINE IDENTITY
@@ -75,18 +90,17 @@ async function identify() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// HEARTBEAT — ALWAYS re-identify to get fresh scrape_settings
+// HEARTBEAT
 // ═══════════════════════════════════════════════════════════
 
 async function heartbeat() {
-  const { cachedIdentity, machineId, jobsScrapedToday, messagesCapturedToday, lastScraperError } 
+  const { cachedIdentity, machineId, jobsScrapedToday, messagesCapturedToday, lastScraperError }
     = await chrome.storage.local.get([
       'cachedIdentity', 'machineId', 'jobsScrapedToday', 'messagesCapturedToday', 'lastScraperError'
     ]);
 
   if (!machineId) { console.warn('[OU] heartbeat: no machineId'); return; }
 
-  // Heartbeat
   const body = {
     machine_id: machineId, version: EXT_VERSION,
     account_slug: cachedIdentity?.member?.slug || 'unknown',
@@ -105,6 +119,13 @@ async function heartbeat() {
     const data = await res.json();
     console.log('[OU] Heartbeat OK');
 
+    // v17.1.0 Fix A: clear stale error once server confirms success.
+    // Without this, a single transient fetch failure leaves a permanent
+    // lastScraperError that the server keeps alerting on forever.
+    if (body.scraper_error || lastScraperError) {
+      await chrome.storage.local.remove('lastScraperError');
+    }
+
     if (data.update_info?.update_available) {
       await chrome.storage.local.set({ pendingUpdate: data.update_info, pausedUntilUpdate: data.force_update });
       if (data.force_update) console.warn('[OU] FORCE UPDATE — scraper paused');
@@ -113,18 +134,18 @@ async function heartbeat() {
     }
   } catch (e) {
     console.error('[OU] Heartbeat failed:', e);
+    // v17.1.0 Fix A: only persist transient network errors; don't spam
+    // the server with them (server-side dedup is also added in extension-config).
     await chrome.storage.local.set({ lastScraperError: String(e).substring(0, 300) });
   }
 
-  // Re-identify every heartbeat to get fresh scrape_settings
   await identify();
-
-  // Check if it's time to reload the Upwork tab
   await maybeReloadUpworkTab();
+  await maybeProcessEnrichQueue();
 }
 
 // ═══════════════════════════════════════════════════════════
-// AUTO-RELOAD SCHEDULER — v17.0.4
+// AUTO-RELOAD SCHEDULER
 // ═══════════════════════════════════════════════════════════
 
 async function maybeReloadUpworkTab() {
@@ -133,20 +154,14 @@ async function maybeReloadUpworkTab() {
       'cachedIdentity', 'lastReloadAt', 'pausedUntilUpdate'
     ]);
 
-    // Gate: need bidding-enabled freelancer + not paused for update
     if (!cachedIdentity?.member?.is_bidding_enabled) return;
     if (pausedUntilUpdate) { console.log('[OU] reload skip: paused for update'); return; }
 
     const settings = cachedIdentity?.scrape_settings;
     if (!settings || !settings.enabled) { console.log('[OU] reload skip: scraper disabled'); return; }
-    if (settings.pattern_mode === 'paused') { console.log('[OU] reload skip: pattern_mode=paused (quiet hours)'); return; }
+    if (settings.pattern_mode === 'paused') { console.log('[OU] reload skip: pattern_mode=paused'); return; }
 
-    // Check quiet hours in user's TZ (use local for simplicity; scheduler already accounts for TZ)
-    const nowHour = new Date().getUTCHours();  // approximate — scheduler is authoritative
-    // Actually trust pattern_mode='paused' from server for quiet hours
-
-    // Minimum interval since last reload (absolute floor, prevent too-frequent reloads)
-    const minSec = Math.max(settings.min_interval_sec || 180, 120);  // at least 2 min
+    const minSec = Math.max(settings.min_interval_sec || 180, 120);
     const maxSec = Math.max(settings.max_interval_sec || 2700, minSec + 60);
 
     const sinceLastReload = lastReloadAt ? (Date.now() - lastReloadAt) / 1000 : Infinity;
@@ -155,7 +170,6 @@ async function maybeReloadUpworkTab() {
       return;
     }
 
-    // Check server's next_scrape_at — if in future, wait
     if (settings.next_scrape_at) {
       const nextAt = new Date(settings.next_scrape_at).getTime();
       if (Date.now() < nextAt) {
@@ -165,38 +179,360 @@ async function maybeReloadUpworkTab() {
       }
     }
 
-    // Find an open Upwork job-search tab
     const tabs = await chrome.tabs.query({
       url: ['https://www.upwork.com/nx/search/jobs/*', 'https://www.upwork.com/nx/find-work/*']
     });
+    if (tabs.length === 0) { console.log('[OU] reload skip: no Upwork job-search tab open'); return; }
 
-    if (tabs.length === 0) {
-      console.log('[OU] reload skip: no Upwork job-search tab open');
-      return;
-    }
-
-    // Pick the most recently active tab
     const tab = tabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0];
-
-    // Add human-like jitter: ±30 sec randomness
     const jitterMs = Math.floor((Math.random() - 0.5) * 60 * 1000);
     const delayMs = Math.max(0, jitterMs);
 
-    console.log(`[OU] ⏰ Scheduling reload of tab ${tab.id} in ${Math.round(delayMs/1000)}s (with jitter)`);
-
+    console.log(`[OU] ⏰ Scheduling reload of tab ${tab.id} in ${Math.round(delayMs/1000)}s`);
     setTimeout(async () => {
       try {
         await chrome.tabs.reload(tab.id);
         await chrome.storage.local.set({ lastReloadAt: Date.now() });
         console.log('[OU] 🔄 Reloaded tab', tab.id, tab.url);
-      } catch (e) {
-        console.warn('[OU] reload failed:', e);
-      }
+      } catch (e) { console.warn('[OU] reload failed:', e); }
     }, delayMs);
 
-  } catch (e) {
-    console.warn('[OU] maybeReloadUpworkTab error:', e);
+  } catch (e) { console.warn('[OU] maybeReloadUpworkTab error:', e); }
+}
+
+// ═══════════════════════════════════════════════════════════
+// ENRICHMENT QUEUE — new in v17.1.0
+// ═══════════════════════════════════════════════════════════
+
+function pickDelayMs() {
+  const r = Math.random();
+  let acc = 0;
+  for (const [w, minMs, maxMs] of ENRICH_DELAY_WEIGHTS) {
+    acc += w;
+    if (r <= acc) return minMs + Math.floor(Math.random() * (maxMs - minMs));
   }
+  const [, minMs, maxMs] = ENRICH_DELAY_WEIGHTS[ENRICH_DELAY_WEIGHTS.length - 1];
+  return minMs + Math.floor(Math.random() * (maxMs - minMs));
+}
+
+function normalizeJobUrl(url) {
+  try {
+    const u = new URL(url);
+    u.search = '';
+    u.hash = '';
+    u.pathname = u.pathname.replace(/span-class-highlight-[^-\/]+-span-/gi, '');
+    return u.toString();
+  } catch { return url; }
+}
+
+async function getQueue() {
+  const { enrichQueue } = await chrome.storage.local.get('enrichQueue');
+  return Array.isArray(enrichQueue) ? enrichQueue : [];
+}
+
+async function setQueue(q) {
+  await chrome.storage.local.set({ enrichQueue: q.slice(0, ENRICH_MAX_QUEUE) });
+}
+
+async function enqueueForEnrichment(items) {
+  const q = await getQueue();
+  const seen = new Set(q.map(x => x.upwork_id));
+  const addedIds = [];
+  for (const it of items) {
+    if (!it?.upwork_id || !it?.url) continue;
+    if (seen.has(it.upwork_id)) continue;
+    q.push({
+      upwork_id: it.upwork_id,
+      url: normalizeJobUrl(it.url),
+      title: (it.title || '').substring(0, 200),
+      skills: (it.skills || []).slice(0, 10),
+      queued_at: Date.now(),
+      attempts: 0,
+    });
+    seen.add(it.upwork_id);
+    addedIds.push(it.upwork_id);
+  }
+  await setQueue(q);
+  if (addedIds.length > 0) console.log(`[OU enrich] +${addedIds.length} queued, total ${q.length}`);
+  return addedIds;
+}
+
+async function getHourlyCount() {
+  const { enrichHourBucket } = await chrome.storage.local.get('enrichHourBucket');
+  const nowHour = Math.floor(Date.now() / 3600000);
+  if (!enrichHourBucket || enrichHourBucket.hour !== nowHour) {
+    await chrome.storage.local.set({ enrichHourBucket: { hour: nowHour, count: 0 } });
+    return 0;
+  }
+  return enrichHourBucket.count || 0;
+}
+
+async function incHourlyCount() {
+  const { enrichHourBucket } = await chrome.storage.local.get('enrichHourBucket');
+  const nowHour = Math.floor(Date.now() / 3600000);
+  const bucket = enrichHourBucket && enrichHourBucket.hour === nowHour
+    ? { hour: nowHour, count: (enrichHourBucket.count || 0) + 1 }
+    : { hour: nowHour, count: 1 };
+  await chrome.storage.local.set({ enrichHourBucket: bucket });
+}
+
+async function getHaltedUntil() {
+  const r = await chrome.storage.local.get('enrichHaltedUntil');
+  return typeof r.enrichHaltedUntil === 'number' ? r.enrichHaltedUntil : 0;
+}
+
+async function haltEnrich(reason, minutes) {
+  const until = Date.now() + minutes * 60 * 1000;
+  await chrome.storage.local.set({ enrichHaltedUntil: until, enrichHaltReason: reason });
+  console.warn(`[OU enrich] 🛑 HALTED until ${new Date(until).toISOString()} — ${reason}`);
+  await sendTgHaltAlert(reason, minutes);
+}
+
+async function sendTgHaltAlert(reason, minutes) {
+  try {
+    const { machineId, cachedIdentity } = await chrome.storage.local.get(['machineId', 'cachedIdentity']);
+    await fetch(`${SB_URL}/functions/v1/extension-job-enrich/halt-alert`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: machineId,
+        account_slug: cachedIdentity?.member?.slug,
+        reason,
+        halted_minutes: minutes,
+      }),
+    });
+  } catch {}
+}
+
+async function logEnrichmentEvent(status, details) {
+  // v17.1.0 Fix D: circuit breaker — if the log endpoint fails 3 times in a
+  // row, back off for 10 minutes to avoid creating a new "Failed to fetch"
+  // spam loop from the enrichment path.
+  try {
+    const { enrichLogCircuit } = await chrome.storage.local.get('enrichLogCircuit');
+    if (enrichLogCircuit?.openUntil && Date.now() < enrichLogCircuit.openUntil) return;
+  } catch {}
+
+  try {
+    const { machineId, cachedIdentity } = await chrome.storage.local.get(['machineId', 'cachedIdentity']);
+    const res = await fetch(`${SB_URL}/functions/v1/extension-job-enrich/log`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: machineId,
+        account_slug: cachedIdentity?.member?.slug,
+        status,
+        ...details,
+      }),
+    });
+    if (res.ok) {
+      // reset circuit on any success
+      await chrome.storage.local.remove('enrichLogCircuit');
+    } else {
+      await bumpLogCircuit();
+    }
+  } catch {
+    await bumpLogCircuit();
+  }
+}
+
+async function bumpLogCircuit() {
+  try {
+    const { enrichLogCircuit } = await chrome.storage.local.get('enrichLogCircuit');
+    const fails = (enrichLogCircuit?.fails || 0) + 1;
+    if (fails >= 3) {
+      await chrome.storage.local.set({
+        enrichLogCircuit: { fails: 0, openUntil: Date.now() + 10 * 60 * 1000 }
+      });
+      console.warn('[OU enrich] log circuit open for 10min');
+    } else {
+      await chrome.storage.local.set({ enrichLogCircuit: { fails, openUntil: 0 } });
+    }
+  } catch {}
+}
+
+let _enrichInFlight = false;
+
+async function maybeProcessEnrichQueue() {
+  if (_enrichInFlight) return;
+
+  const haltedUntil = await getHaltedUntil();
+  if (Date.now() < haltedUntil) {
+    console.log(`[OU enrich] skip: halted for ${Math.round((haltedUntil - Date.now())/60000)}m more`);
+    return;
+  }
+
+  const { cachedIdentity, pausedUntilUpdate, lastEnrichAt } = await chrome.storage.local.get([
+    'cachedIdentity', 'pausedUntilUpdate', 'lastEnrichAt'
+  ]);
+  if (pausedUntilUpdate) return;
+  if (!cachedIdentity?.member?.is_bidding_enabled) return;
+
+  const settings = cachedIdentity?.scrape_settings;
+  if (settings?.pattern_mode === 'paused') {
+    console.log('[OU enrich] skip: quiet hours');
+    return;
+  }
+
+  const hourly = await getHourlyCount();
+  if (hourly >= ENRICH_MAX_PER_HOUR) {
+    console.log(`[OU enrich] skip: hourly cap ${hourly}/${ENRICH_MAX_PER_HOUR}`);
+    return;
+  }
+
+  if (lastEnrichAt) {
+    const since = Date.now() - lastEnrichAt;
+    if (since < 25000) return;
+  }
+
+  const q = await getQueue();
+  if (q.length === 0) return;
+
+  const head = q[0];
+  const rest = q.slice(1);
+  await setQueue(rest);
+
+  _enrichInFlight = true;
+  try {
+    await processOneJob(head);
+  } catch (e) {
+    console.warn('[OU enrich] processOneJob threw', e);
+  } finally {
+    _enrichInFlight = false;
+    await chrome.storage.local.set({ lastEnrichAt: Date.now() });
+  }
+
+  const nextDelay = pickDelayMs();
+  console.log(`[OU enrich] ⏳ next attempt in ${Math.round(nextDelay/1000)}s`);
+  setTimeout(() => { maybeProcessEnrichQueue().catch(() => {}); }, nextDelay);
+}
+
+async function processOneJob(item) {
+  const startedAt = Date.now();
+  console.log('[OU enrich] ▶ opening', item.upwork_id, item.title?.substring(0, 60));
+
+  let tabId = null;
+  let settled = false;
+  let timeoutHandle = null;
+
+  const resultPromise = new Promise((resolve) => {
+    const listener = (msg, sender) => {
+      if (msg?.type !== 'ENRICH_RESULT') return;
+      if (sender?.tab?.id && tabId && sender.tab.id !== tabId) return;
+      if (settled) return;
+      settled = true;
+      chrome.runtime.onMessage.removeListener(listener);
+      resolve(msg.payload);
+    };
+    chrome.runtime.onMessage.addListener(listener);
+
+    timeoutHandle = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      chrome.runtime.onMessage.removeListener(listener);
+      resolve({ ok: false, error_type: 'tab_timeout', error_detail: 'Hard timeout reached', upwork_job_id: item.upwork_id, url: item.url });
+    }, ENRICH_TAB_TIMEOUT_MS);
+  });
+
+  try {
+    const tab = await chrome.tabs.create({ url: item.url, active: false, pinned: false });
+    tabId = tab.id;
+  } catch (e) {
+    await logEnrichmentEvent('failed', {
+      upwork_job_id: item.upwork_id, error_type: 'tab_create_fail',
+      error_detail: String(e?.message || e), duration_ms: Date.now() - startedAt,
+    });
+    return;
+  }
+
+  const loadedPromise = new Promise((resolve) => {
+    const onUpdated = (id, changeInfo) => {
+      if (id !== tabId) return;
+      if (changeInfo.status === 'complete') {
+        chrome.tabs.onUpdated.removeListener(onUpdated);
+        resolve();
+      }
+    };
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      resolve();
+    }, 20000);
+  });
+
+  await loadedPromise;
+  await new Promise(r => setTimeout(r, ENRICH_MIN_INITIAL_WAIT_MS + Math.floor(Math.random() * 1500)));
+
+  if (tabId) {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        files: ['scripts/enrich.js'],
+      });
+    } catch (e) {
+      console.warn('[OU enrich] inject fail:', e);
+    }
+  }
+
+  const payload = await resultPromise;
+  if (timeoutHandle) clearTimeout(timeoutHandle);
+
+  if (tabId !== null) {
+    try { await chrome.tabs.remove(tabId); } catch {}
+  }
+
+  await incHourlyCount();
+  const duration_ms = Date.now() - startedAt;
+
+  const authFailures = ['login_redirect', 'signup_redirect', 'challenge', 'bot_check'];
+  if (payload && !payload.ok && authFailures.includes(payload.error_type)) {
+    await logEnrichmentEvent('auth_failure', {
+      upwork_job_id: item.upwork_id, error_type: payload.error_type,
+      error_detail: payload.error_detail, duration_ms,
+    });
+    await haltEnrich(payload.error_type, ENRICH_AUTH_HALT_MINUTES);
+    const q = await getQueue();
+    await setQueue([item, ...q]);
+    return;
+  }
+
+  if (payload?.ok && payload.description && payload.description.length >= 200) {
+    const { machineId, cachedIdentity } = await chrome.storage.local.get(['machineId', 'cachedIdentity']);
+    try {
+      const res = await fetch(`${SB_URL}/functions/v1/extension-job-enrich`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          machine_id: machineId,
+          account_slug: cachedIdentity?.member?.slug,
+          enrichment: payload,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      await logEnrichmentEvent('success', {
+        upwork_job_id: item.upwork_id,
+        description_chars: payload.description.length,
+        duration_ms,
+      });
+      console.log('[OU enrich] ✓', item.upwork_id, 'desc=', payload.description.length, 'srv=', data?.ok);
+    } catch (e) {
+      await logEnrichmentEvent('post_failed', {
+        upwork_job_id: item.upwork_id,
+        error_type: 'post_exception',
+        error_detail: String(e?.message || e),
+        duration_ms,
+      });
+    }
+    return;
+  }
+
+  await logEnrichmentEvent('failed', {
+    upwork_job_id: item.upwork_id,
+    error_type: payload?.error_type || 'unknown',
+    error_detail: payload?.error_detail || 'No description returned',
+    duration_ms,
+  });
+  console.log('[OU enrich] ✗', item.upwork_id, payload?.error_type);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -225,6 +561,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     handleScrapedJob(msg.payload).then(r => sendResponse(r)).catch(e => sendResponse({ error: String(e) }));
     return true;
   }
+  if (msg?.type === 'JOBS_CANDIDATES') {
+    handleJobsCandidates(msg.payload).then(r => sendResponse(r)).catch(e => sendResponse({ error: String(e) }));
+    return true;
+  }
   if (msg?.type === 'GET_IDENTITY') {
     chrome.storage.local.get(['cachedIdentity', 'machineId']).then(r => sendResponse(r));
     return true;
@@ -233,6 +573,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     identify().then(r => sendResponse({ ok: true, identity: r }));
     return true;
   }
+  // ENRICH_RESULT is handled via per-tab listener inside processOneJob
 });
 
 async function handleInboundMessage(payload) {
@@ -242,28 +583,23 @@ async function handleInboundMessage(payload) {
   if (pausedUntilUpdate) return { skipped: 'paused_for_update' };
   if (!cachedIdentity?.member) return { skipped: 'no_identity' };
 
-  const body = {
-    ...payload,
-    account_slug: cachedIdentity.member.slug,
-    machine_id: machineId
-  };
-
+  const body = { ...payload, account_slug: cachedIdentity.member.slug, machine_id: machineId };
   try {
     const r = await fetch(`${SB_URL}/functions/v1/reply-generator`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
     });
     const data = await r.json();
-
     const today = new Date().toDateString();
     const stored = await chrome.storage.local.get(['messagesCapturedToday', 'countsDate']);
     const count = (stored.countsDate === today) ? (stored.messagesCapturedToday || 0) + 1 : 1;
     await chrome.storage.local.set({ messagesCapturedToday: count, countsDate: today });
-
     return { ok: true, data };
   } catch (e) { return { error: String(e) }; }
 }
 
 async function handleScrapedJob(payload) {
+  // v17.1.0: ingest-only — leadgen-v2 upserts the row but does NOT score yet.
+  // Scoring is triggered by extension-job-enrich after full description arrives.
   const { cachedIdentity, machineId, pausedUntilUpdate } = await chrome.storage.local.get([
     'cachedIdentity', 'machineId', 'pausedUntilUpdate'
   ]);
@@ -273,7 +609,8 @@ async function handleScrapedJob(payload) {
   const body = {
     account_slug: cachedIdentity.member.slug,
     machine_id: machineId,
-    job: payload
+    job: payload,
+    ingest_only: true,
   };
 
   fetch(`${SB_URL}/functions/v1/leadgen-v2`, {
@@ -288,8 +625,53 @@ async function handleScrapedJob(payload) {
   return { ok: true, queued: payload.upwork_id || payload.url };
 }
 
+function prerank(jobs, specialization) {
+  const kws = (specialization || [])
+    .map(s => String(s || '').toLowerCase().trim())
+    .filter(s => s.length >= 3);
+
+  if (kws.length === 0) return jobs.slice(0, 5);
+
+  const scored = jobs.map(j => {
+    const hay = `${(j.title || '').toLowerCase()} ${(j.skills || []).join(' ').toLowerCase()}`;
+    let score = 0;
+    for (const kw of kws) {
+      if (hay.includes(kw)) score += 2;
+      else {
+        const words = hay.split(/\W+/);
+        if (words.some(w => (w.startsWith(kw) && w.length >= kw.length) || (kw.startsWith(w) && w.length > 3))) score += 1;
+      }
+    }
+    return { job: j, score };
+  });
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, 5).map(x => x.job);
+}
+
+async function handleJobsCandidates(payload) {
+  const jobs = payload?.jobs || [];
+  if (jobs.length === 0) return { ok: true, enqueued: 0 };
+
+  const { cachedIdentity } = await chrome.storage.local.get('cachedIdentity');
+  if (!cachedIdentity?.member?.is_bidding_enabled) return { skipped: 'bidding_disabled' };
+
+  const spec = cachedIdentity.account?.specialization || cachedIdentity.member?.specialization || [];
+  const top = prerank(jobs, spec);
+
+  const addedIds = await enqueueForEnrichment(top.map(j => ({
+    upwork_id: j.upwork_id,
+    url: j.url,
+    title: j.title,
+    skills: j.skills,
+  })));
+
+  maybeProcessEnrichQueue().catch(() => {});
+
+  return { ok: true, enqueued: addedIds.length, total_candidates: jobs.length };
+}
+
 // ═══════════════════════════════════════════════════════════
-// ALARMS — heartbeat every 2 min (was 5) so reload check is responsive
+// ALARMS
 // ═══════════════════════════════════════════════════════════
 
 chrome.runtime.onInstalled.addListener(async () => {
@@ -297,6 +679,7 @@ chrome.runtime.onInstalled.addListener(async () => {
   await chrome.alarms.clearAll();
   chrome.alarms.create('heartbeat', { periodInMinutes: 2 });
   chrome.alarms.create('daily-reset', { periodInMinutes: 60 });
+  chrome.alarms.create('enrich-drain', { periodInMinutes: 1 });
   await identify();
   await dailyReset();
   await heartbeat();
@@ -307,6 +690,7 @@ chrome.runtime.onStartup.addListener(async () => {
   await chrome.alarms.clearAll();
   chrome.alarms.create('heartbeat', { periodInMinutes: 2 });
   chrome.alarms.create('daily-reset', { periodInMinutes: 60 });
+  chrome.alarms.create('enrich-drain', { periodInMinutes: 1 });
   await identify();
   await dailyReset();
   await heartbeat();
@@ -315,9 +699,9 @@ chrome.runtime.onStartup.addListener(async () => {
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === 'heartbeat') await heartbeat();
   if (alarm.name === 'daily-reset') await dailyReset();
+  if (alarm.name === 'enrich-drain') await maybeProcessEnrichQueue();
 });
 
-// Initial run
 (async () => {
   await getMachineId();
   const stored = await chrome.storage.local.get('cachedIdentityAt');
