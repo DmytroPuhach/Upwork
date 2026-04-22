@@ -179,12 +179,27 @@ async function maybeReloadUpworkTab() {
       }
     }
 
-    const tabs = await chrome.tabs.query({
-      url: ['https://www.upwork.com/nx/search/jobs/*', 'https://www.upwork.com/nx/find-work/*']
-    });
-    if (tabs.length === 0) { console.log('[OU] reload skip: no Upwork job-search tab open'); return; }
+    // v17.1.0: prefer the tracked scraping tab if Start Scraping was used
+    const { scrapingTabId } = await chrome.storage.local.get('scrapingTabId');
+    let tab = null;
+    if (scrapingTabId) {
+      try {
+        tab = await chrome.tabs.get(scrapingTabId);
+        if (tab && !/\/nx\/(search\/jobs|find-work)/.test(tab.url || '')) {
+          // user navigated away from search — don't force reload
+          console.log('[OU] reload skip: scraping tab is no longer on search page');
+          return;
+        }
+      } catch { tab = null; }
+    }
 
-    const tab = tabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0];
+    if (!tab) {
+      const tabs = await chrome.tabs.query({
+        url: ['https://www.upwork.com/nx/search/jobs/*', 'https://www.upwork.com/nx/find-work/*']
+      });
+      if (tabs.length === 0) { console.log('[OU] reload skip: no Upwork job-search tab open'); return; }
+      tab = tabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0];
+    }
     const jitterMs = Math.floor((Math.random() - 0.5) * 60 * 1000);
     const delayMs = Math.max(0, jitterMs);
 
@@ -573,7 +588,134 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     identify().then(r => sendResponse({ ok: true, identity: r }));
     return true;
   }
+  // v17.1.0 — new popup controls
+  if (msg?.type === 'START_SCRAPING') {
+    startScraping(msg.payload || {}).then(r => sendResponse(r)).catch(e => sendResponse({ error: String(e) }));
+    return true;
+  }
+  if (msg?.type === 'STOP_SCRAPING') {
+    stopScraping().then(r => sendResponse(r)).catch(e => sendResponse({ error: String(e) }));
+    return true;
+  }
+  if (msg?.type === 'UPDATE_PRESET') {
+    updatePreset(msg.payload || {}).then(r => sendResponse(r)).catch(e => sendResponse({ error: String(e) }));
+    return true;
+  }
+  if (msg?.type === 'GET_SCRAPING_STATE') {
+    chrome.storage.local.get(['scrapingActive', 'scrapingTabId', 'cachedIdentity'])
+      .then(r => sendResponse({
+        active: !!r.scrapingActive,
+        tabId: r.scrapingTabId || null,
+        preset: r.cachedIdentity?.scrape_preset || { query: 'seo', sort: 'recency', hourly: null }
+      }));
+    return true;
+  }
   // ENRICH_RESULT is handled via per-tab listener inside processOneJob
+});
+
+// ═══════════════════════════════════════════════════════════
+// v17.1.0 — START/STOP SCRAPING + UPDATE PRESET
+// ═══════════════════════════════════════════════════════════
+
+function buildSearchUrl(preset) {
+  const q = encodeURIComponent((preset?.query || 'seo').trim());
+  const sort = preset?.sort === 'relevance' ? 'relevance' : 'recency';
+  const params = [
+    `q=${q}`,
+    `sort=${sort}`,
+    `from_recent_search=true`,
+  ];
+  if (preset?.hourly === true) params.push('t=0');   // Upwork: t=0 = hourly
+  if (preset?.hourly === false) params.push('t=1');  // t=1 = fixed
+  return `https://www.upwork.com/nx/search/jobs/?${params.join('&')}`;
+}
+
+async function startScraping(opts) {
+  const { cachedIdentity, scrapingTabId, machineId } = await chrome.storage.local.get([
+    'cachedIdentity', 'scrapingTabId', 'machineId'
+  ]);
+
+  if (!cachedIdentity?.member?.is_bidding_enabled) {
+    return { ok: false, error: 'Bidding disabled for this account' };
+  }
+
+  // If there's already a scraping tab — focus it
+  if (scrapingTabId) {
+    try {
+      const tab = await chrome.tabs.get(scrapingTabId);
+      if (tab) {
+        await chrome.tabs.update(scrapingTabId, { active: true });
+        if (tab.windowId) await chrome.windows.update(tab.windowId, { focused: true });
+        return { ok: true, reused: true, tabId: scrapingTabId };
+      }
+    } catch {
+      // tab no longer exists, fall through and create a new one
+    }
+  }
+
+  const preset = opts.preset || cachedIdentity?.scrape_preset || { query: 'seo', sort: 'recency' };
+  const url = buildSearchUrl(preset);
+  console.log('[OU] ▶ START scraping at', url);
+
+  const tab = await chrome.tabs.create({ url, active: true });
+  await chrome.storage.local.set({
+    scrapingActive: true,
+    scrapingTabId: tab.id,
+    scrapingStartedAt: Date.now(),
+  });
+  return { ok: true, tabId: tab.id, url };
+}
+
+async function stopScraping() {
+  const { scrapingTabId } = await chrome.storage.local.get('scrapingTabId');
+  if (scrapingTabId) {
+    try { await chrome.tabs.remove(scrapingTabId); } catch {}
+  }
+  await chrome.storage.local.set({
+    scrapingActive: false,
+    scrapingTabId: null,
+  });
+  console.log('[OU] ⏸ STOP scraping');
+  return { ok: true };
+}
+
+async function updatePreset(newPreset) {
+  const { machineId, cachedIdentity } = await chrome.storage.local.get(['machineId', 'cachedIdentity']);
+  if (!machineId) return { ok: false, error: 'no machine_id' };
+
+  const sanitized = {
+    query: String(newPreset.query || 'seo').substring(0, 100).trim() || 'seo',
+    sort: newPreset.sort === 'relevance' ? 'relevance' : 'recency',
+    hourly: newPreset.hourly === true ? true : newPreset.hourly === false ? false : null,
+  };
+
+  try {
+    const res = await fetch(`${SB_URL}/functions/v1/extension-config/preset`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ machine_id: machineId, scrape_preset: sanitized }),
+    });
+    const data = await res.json();
+    if (!data.ok) return { ok: false, error: data.error || 'preset save failed' };
+
+    // Update cached identity locally so next startScraping uses the new preset
+    if (cachedIdentity) {
+      cachedIdentity.scrape_preset = data.scrape_preset;
+      await chrome.storage.local.set({ cachedIdentity });
+    }
+    return { ok: true, scrape_preset: data.scrape_preset };
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e) };
+  }
+}
+
+// Track when the scraping tab is closed — clean up state
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  const { scrapingTabId } = await chrome.storage.local.get('scrapingTabId');
+  if (scrapingTabId && scrapingTabId === tabId) {
+    await chrome.storage.local.set({ scrapingActive: false, scrapingTabId: null });
+    console.log('[OU] scraping tab closed by user →  scrapingActive=false');
+  }
 });
 
 async function handleInboundMessage(payload) {

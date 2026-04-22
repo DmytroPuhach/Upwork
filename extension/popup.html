@@ -3,38 +3,96 @@
 <head>
   <meta charset="UTF-8">
   <style>
-    body { width: 320px; font-family: -apple-system, BlinkMacSystemFont, sans-serif; padding: 12px; margin: 0; font-size: 13px; color: #222; }
+    body { width: 340px; font-family: -apple-system, BlinkMacSystemFont, sans-serif; padding: 12px; margin: 0; font-size: 13px; color: #222; }
     h2 { margin: 0 0 4px 0; font-size: 16px; color: #14A800; }
+    h3 { margin: 12px 0 6px 0; font-size: 12px; color: #666; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
     .version-line { font-size: 11px; color: #888; margin-bottom: 12px; font-family: monospace; }
-    .row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #eee; }
+    .row { display: flex; justify-content: space-between; padding: 5px 0; border-bottom: 1px solid #eee; }
     .row:last-child { border-bottom: none; }
     .label { color: #666; }
     .value { font-weight: 500; }
     .status-ok { color: #14A800; }
     .status-warn { color: #f59e0b; }
     .status-err { color: #dc2626; }
-    button { width: 100%; padding: 8px; margin-top: 10px; border: 1px solid #14A800; background: white; color: #14A800; border-radius: 4px; cursor: pointer; font-size: 13px; }
+
+    /* Scraping control panel */
+    .scrape-panel { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 6px; padding: 10px; margin: 10px 0; }
+    .scrape-panel.active { background: #f0fdf4; border-color: #14A800; }
+    .scrape-state { font-weight: 600; margin-bottom: 8px; }
+    .scrape-state.on { color: #14A800; }
+    .scrape-state.off { color: #6b7280; }
+    .field { display: flex; align-items: center; margin: 6px 0; gap: 8px; }
+    .field label { flex: 0 0 64px; color: #555; font-size: 12px; }
+    .field input, .field select { flex: 1; padding: 5px 8px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 13px; background: white; }
+    .field input:focus, .field select:focus { outline: none; border-color: #14A800; }
+
+    button { width: 100%; padding: 8px; margin-top: 8px; border: 1px solid #14A800; background: white; color: #14A800; border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: 500; }
     button:hover { background: #f0fdf4; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.primary { background: #14A800; color: white; }
+    button.primary:hover { background: #108a00; }
+    button.danger { border-color: #dc2626; color: #dc2626; }
+    button.danger:hover { background: #fef2f2; }
+    button.secondary { border-color: #d1d5db; color: #555; font-weight: normal; font-size: 12px; }
+    button.secondary:hover { background: #f9fafb; }
+
     .update-banner { background: #fef3c7; border: 1px solid #f59e0b; padding: 8px; margin-top: 10px; border-radius: 4px; font-size: 12px; }
+    .msg { font-size: 11px; color: #6b7280; margin-top: 4px; min-height: 14px; }
+    .msg.err { color: #dc2626; }
+    .msg.ok { color: #14A800; }
   </style>
 </head>
 <body>
   <h2>OptimizeUp Agent</h2>
   <div class="version-line">v<span id="extVersion">?</span></div>
+
   <div class="row"><span class="label">Account:</span> <span class="value" id="memberSlug">—</span></div>
-  <div class="row"><span class="label">Role:</span> <span class="value" id="memberRole">—</span></div>
   <div class="row"><span class="label">Bidding:</span> <span class="value" id="biddingStatus">—</span></div>
   <div class="row"><span class="label">Scraper:</span> <span class="value" id="scraperStatus">—</span></div>
   <div class="row"><span class="label">Jobs today:</span> <span class="value" id="jobsToday">0</span></div>
   <div class="row"><span class="label">Messages today:</span> <span class="value" id="messagesToday">0</span></div>
   <div class="row"><span class="label">Last heartbeat:</span> <span class="value" id="lastHeartbeat">—</span></div>
+
+  <h3>Scraping Control</h3>
+  <div id="scrapePanel" class="scrape-panel">
+    <div id="scrapeState" class="scrape-state off">⏸ Stopped</div>
+
+    <div class="field">
+      <label for="presetQuery">Query:</label>
+      <input id="presetQuery" type="text" placeholder="seo" maxlength="100" />
+    </div>
+    <div class="field">
+      <label for="presetSort">Sort:</label>
+      <select id="presetSort">
+        <option value="recency">Most Recent</option>
+        <option value="relevance">Best Match</option>
+      </select>
+    </div>
+    <div class="field">
+      <label for="presetType">Type:</label>
+      <select id="presetType">
+        <option value="any">Any</option>
+        <option value="hourly">Hourly</option>
+        <option value="fixed">Fixed</option>
+      </select>
+    </div>
+
+    <button id="startBtn" class="primary">▶ Start Scraping</button>
+    <button id="stopBtn" class="danger" style="display:none;">⏸ Stop Scraping</button>
+    <button id="savePresetBtn" class="secondary">💾 Save preset to account</button>
+    <div id="presetMsg" class="msg"></div>
+  </div>
+
   <div class="row"><span class="label">Machine:</span> <span class="value" id="machineId" style="font-size: 11px; font-family: monospace;">—</span></div>
+
   <div id="updateBanner" class="update-banner" style="display: none;">
     <strong>🔄 Update available</strong>
     <div id="updateInfo"></div>
     <button id="updateBtn">Reload extension</button>
   </div>
-  <button id="refreshBtn">🔄 Refresh identity</button>
+
+  <button id="refreshBtn" class="secondary" style="margin-top: 12px;">🔄 Refresh identity</button>
+
   <script src="popup.js"></script>
 </body>
 </html>

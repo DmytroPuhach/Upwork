@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "OptimizeUp Agency Assistant",
-  "version": "17.1.0",
-  "description": "Internal agency tool for OptimizeUp team — job scraping, enrichment (v17.1.0), message monitoring, auto-identify per account.",
+  "version": "17.1.1",
+  "description": "Internal agency tool for OptimizeUp team — job scraping, enrichment (v17.1.1), Start/Stop controls, message monitoring, auto-identify per account.",
   "permissions": ["storage", "alarms", "activeTab", "scripting", "tabs"],
   "host_permissions": [
     "https://www.upwork.com/*",
