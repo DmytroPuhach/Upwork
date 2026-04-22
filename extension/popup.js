@@ -1,4 +1,6 @@
-// OptimizeUp Extension v17.0.1 — popup
+// OptimizeUp Extension — popup
+
+document.getElementById('extVersion').textContent = chrome.runtime.getManifest().version;
 
 function fmtTime(iso) {
   if (!iso) return '—';
@@ -55,6 +57,7 @@ async function loadStatus() {
     document.getElementById('updateInfo').innerHTML = `
       <div>Current: ${pendingUpdate.current_version}</div>
       <div>Latest: <strong>${pendingUpdate.latest_version}</strong></div>
+      <div style="margin-top: 4px; font-size: 11px;">Run in terminal:<br><code>curl -fsSL https://app.optimizeup.io/ext/update.sh | bash</code></div>
       ${pendingUpdate.force_update ? '<div style="color:#c00;"><strong>Required</strong></div>' : ''}
     `;
   }
@@ -67,12 +70,7 @@ document.getElementById('refreshBtn').addEventListener('click', async () => {
   setTimeout(async () => { await loadStatus(); btn.textContent = '🔄 Refresh identity'; }, 1500);
 });
 
-document.getElementById('updateBtn')?.addEventListener('click', async () => {
-  if (chrome.runtime.requestUpdateCheck) {
-    try {
-      await new Promise(r => chrome.runtime.requestUpdateCheck(r));
-    } catch (e) { console.warn(e); }
-  }
+document.getElementById('updateBtn')?.addEventListener('click', () => {
   chrome.runtime.reload();
 });
 

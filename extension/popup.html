@@ -4,7 +4,8 @@
   <meta charset="UTF-8">
   <style>
     body { width: 320px; font-family: -apple-system, BlinkMacSystemFont, sans-serif; padding: 12px; margin: 0; font-size: 13px; color: #222; }
-    h2 { margin: 0 0 12px 0; font-size: 16px; color: #14A800; }
+    h2 { margin: 0 0 4px 0; font-size: 16px; color: #14A800; }
+    .version-line { font-size: 11px; color: #888; margin-bottom: 12px; font-family: monospace; }
     .row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #eee; }
     .row:last-child { border-bottom: none; }
     .label { color: #666; }
@@ -19,6 +20,7 @@
 </head>
 <body>
   <h2>OptimizeUp Agent</h2>
+  <div class="version-line">v<span id="extVersion">?</span></div>
   <div class="row"><span class="label">Account:</span> <span class="value" id="memberSlug">—</span></div>
   <div class="row"><span class="label">Role:</span> <span class="value" id="memberRole">—</span></div>
   <div class="row"><span class="label">Bidding:</span> <span class="value" id="biddingStatus">—</span></div>
@@ -30,7 +32,7 @@
   <div id="updateBanner" class="update-banner" style="display: none;">
     <strong>🔄 Update available</strong>
     <div id="updateInfo"></div>
-    <button id="updateBtn">Update now</button>
+    <button id="updateBtn">Reload extension</button>
   </div>
   <button id="refreshBtn">🔄 Refresh identity</button>
   <script src="popup.js"></script>
