@@ -2,7 +2,7 @@
 {
   "manifest_version": 3,
   "name": "OptimizeUp Agency Assistant",
-  "version": "17.0.2",
+  "version": "17.0.3",
   "description": "Internal agency tool for OptimizeUp team — job scraping, message monitoring, auto-identify per account.",
   "permissions": ["storage", "alarms", "activeTab", "scripting"],
   "host_permissions": [
