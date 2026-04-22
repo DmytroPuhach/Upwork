@@ -266,8 +266,54 @@
     });
   }
 
+  // v17.1.2: simulate human scroll before reading. window.scrollTo with
+  // smooth behavior generates native scroll events (not isTrusted=false
+  // synthetic ones), so Upwork sees "user scrolled through brief".
+  async function simulateReadScroll() {
+    try {
+      // First scroll: quick glance at middle
+      const mid = 300 + Math.floor(Math.random() * 300);  // 300-600px
+      window.scrollTo({ top: mid, behavior: 'smooth' });
+      await new Promise(r => setTimeout(r, 1200 + Math.floor(Math.random() * 800)));  // 1.2-2s
+
+      // Second scroll: further down to see client sidebar / details
+      const deep = 800 + Math.floor(Math.random() * 600);  // 800-1400px
+      window.scrollTo({ top: deep, behavior: 'smooth' });
+      await new Promise(r => setTimeout(r, 1500 + Math.floor(Math.random() * 1000)));  // 1.5-2.5s
+
+      // 60% chance to scroll back up (checking something) — human pattern
+      if (Math.random() < 0.6) {
+        const back = 100 + Math.floor(Math.random() * 300);  // 100-400px
+        window.scrollTo({ top: back, behavior: 'smooth' });
+        await new Promise(r => setTimeout(r, 800 + Math.floor(Math.random() * 800)));
+      }
+    } catch {}
+  }
+
   async function run() {
     log('started on', location.href.substring(0, 120));
+
+    // Check auth failure upfront — before investing scroll time
+    const earlyAuth = detectAuthFailure();
+    if (earlyAuth) {
+      try {
+        await chrome.runtime.sendMessage({
+          type: 'ENRICH_RESULT',
+          payload: {
+            ok: false,
+            upwork_job_id: extractUpworkJobId(),
+            url: location.href,
+            error_type: earlyAuth,
+            error_detail: `Auth/challenge at ${location.href.substring(0, 200)}`,
+            duration_ms: Date.now() - START_TS,
+          },
+        });
+      } catch {}
+      return;
+    }
+
+    // Human-like scroll pattern while waiting for SPA to hydrate
+    await simulateReadScroll();
 
     const descResult = await waitForDescription();
 

@@ -14,13 +14,22 @@ console.log('[OU] Background loaded — version', EXT_VERSION);
 
 const ENRICH_MAX_QUEUE = 50;                  // cap in-memory queue size
 const ENRICH_MAX_PER_HOUR = 5;                // hard rate cap
+// v17.1.2: human read/click cadence. Distribution approximates a real freelancer:
+// most opens 30-75s apart, sometimes slower, and ~5% "long pause" (3-5 min)
+// simulating distraction / coffee break. Gives avg ~75s between opens.
 const ENRICH_DELAY_WEIGHTS = [                // (weight, minMs, maxMs)
-  [0.40, 30000, 45000],    // 30-45s
-  [0.40, 45000, 75000],    // 45-75s
-  [0.20, 75000, 120000],   // 75-120s
+  [0.35, 30000, 45000],    // 30-45s  — quick sequence
+  [0.40, 45000, 75000],    // 45-75s  — normal
+  [0.20, 75000, 140000],   // 75-140s — slower read
+  [0.05, 180000, 300000],  // 3-5 min — distraction
 ];
 const ENRICH_TAB_TIMEOUT_MS = 60000;          // force-close if stuck
-const ENRICH_MIN_INITIAL_WAIT_MS = 2500;      // after tab onUpdated complete
+// v17.1.2: human read time on the single-job page before we extract.
+// Real freelancers spend 15-40s reading a brief. We stay on the low end
+// of that (8-15s) to still drain the queue, but far above the old 2-4s
+// that was clearly synthetic.
+const ENRICH_MIN_READ_MS = 8000;
+const ENRICH_READ_JITTER_MS = 7000;
 const ENRICH_AUTH_HALT_MINUTES = 60;          // after auth_failure, halt this long
 
 // ═══════════════════════════════════════════════════════════
@@ -160,6 +169,8 @@ async function maybeReloadUpworkTab() {
     const settings = cachedIdentity?.scrape_settings;
     if (!settings || !settings.enabled) { console.log('[OU] reload skip: scraper disabled'); return; }
     if (settings.pattern_mode === 'paused') { console.log('[OU] reload skip: pattern_mode=paused'); return; }
+    // v17.1.2: client-side quiet hours in account's own TZ
+    if (isInQuietHours(cachedIdentity)) { console.log('[OU] reload skip: quiet hours (account TZ)'); return; }
 
     const minSec = Math.max(settings.min_interval_sec || 180, 120);
     const maxSec = Math.max(settings.max_interval_sec || 2700, minSec + 60);
@@ -215,8 +226,33 @@ async function maybeReloadUpworkTab() {
   } catch (e) { console.warn('[OU] maybeReloadUpworkTab error:', e); }
 }
 
-// ═══════════════════════════════════════════════════════════
-// ENRICHMENT QUEUE — new in v17.1.0
+// v17.1.2: client-side quiet-hours check using account's own timezone.
+// Uses Intl.DateTimeFormat to convert "now" to the account's local hour.
+// Guards against both server-TZ (Edmonton) and account-TZ being wrong.
+function isInQuietHours(cachedIdentity) {
+  try {
+    const tz = cachedIdentity?.account?.timezone
+            || cachedIdentity?.scrape_settings?.timezone
+            || 'UTC';
+    const qStart = cachedIdentity?.scrape_settings?.quiet_hours_start ?? 22;
+    const qEnd   = cachedIdentity?.scrape_settings?.quiet_hours_end   ?? 7;
+
+    const hourStr = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz, hour12: false, hour: '2-digit'
+    }).format(new Date());
+    const hour = parseInt(hourStr, 10);
+    if (isNaN(hour)) return false;
+
+    // Quiet hours wrap midnight (e.g. 22 → 7) or don't (e.g. 0 → 7)
+    if (qStart <= qEnd) {
+      return hour >= qStart && hour < qEnd;
+    }
+    return hour >= qStart || hour < qEnd;
+  } catch {
+    return false;
+  }
+}
+
 // ═══════════════════════════════════════════════════════════
 
 function pickDelayMs() {
@@ -385,7 +421,16 @@ async function maybeProcessEnrichQueue() {
 
   const settings = cachedIdentity?.scrape_settings;
   if (settings?.pattern_mode === 'paused') {
-    console.log('[OU enrich] skip: quiet hours');
+    console.log('[OU enrich] skip: quiet hours (server-reported)');
+    return;
+  }
+
+  // v17.1.2: double-check quiet hours client-side against the account's own
+  // timezone. scrape_commands.timezone is generic (Edmonton) but accounts.timezone
+  // reflects the operator's real location. We want Upwork to see activity only
+  // during the operator's waking hours.
+  if (isInQuietHours(cachedIdentity)) {
+    console.log('[OU enrich] skip: quiet hours (account TZ)');
     return;
   }
 
@@ -476,7 +521,7 @@ async function processOneJob(item) {
   });
 
   await loadedPromise;
-  await new Promise(r => setTimeout(r, ENRICH_MIN_INITIAL_WAIT_MS + Math.floor(Math.random() * 1500)));
+  await new Promise(r => setTimeout(r, ENRICH_MIN_READ_MS + Math.floor(Math.random() * ENRICH_READ_JITTER_MS)));
 
   if (tabId) {
     try {
