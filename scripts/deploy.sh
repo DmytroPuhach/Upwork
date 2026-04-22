@@ -17,11 +17,10 @@ R="\033[0;31m"; G="\033[0;32m"; Y="\033[1;33m"; B="\033[0;34m"; N="\033[0m"
 
 echo -e "${B}=== OptimizeUp Extension Deploy ===${N}"
 
-# 0. Find chrome binary (google-chrome preferred, snap chromium doesn't work with /opt/)
+# 0. Find chrome binary
 CHROME=""
 for binary in google-chrome google-chrome-stable chrome chromium chromium-browser; do
   if command -v "$binary" >/dev/null 2>&1; then
-    # Skip snap chromium (it's sandboxed)
     BINPATH=$(command -v "$binary")
     if readlink -f "$BINPATH" 2>/dev/null | grep -q snap; then
       echo -e "${Y}Skipping $binary (snap sandbox can't access /opt/)${N}"
@@ -34,9 +33,7 @@ done
 
 if [ -z "$CHROME" ]; then
   echo -e "${R}FATAL: No suitable Chrome/Chromium found.${N}"
-  echo "Install via:"
-  echo "  wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
-  echo "  sudo apt install -y ./google-chrome-stable_current_amd64.deb"
+  echo "Install: wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb && sudo apt install -y ./google-chrome-stable_current_amd64.deb"
   exit 1
 fi
 echo -e "Chrome binary: ${B}$CHROME${N} ($(command -v $CHROME))"
@@ -71,8 +68,6 @@ if [ -f "$CRX_TARGET" ]; then
   echo -e "${Y}v$VERSION exists — rebuilding${N}"
   rm -f "$CRX_TARGET"
 fi
-
-# Remove stale .crx if from previous run
 rm -f "${EXT_DIR}.crx"
 
 # 4. Pack .crx
@@ -91,8 +86,6 @@ sleep 2
 CRX_OUT="${EXT_DIR}.crx"
 if [ ! -f "$CRX_OUT" ]; then
   echo -e "${R}FAIL: Chrome did not produce $CRX_OUT${N}"
-  echo "Try manually:"
-  echo "  $CHROME --pack-extension=$EXT_DIR --pack-extension-key=$PEM --no-sandbox --headless=new"
   exit 1
 fi
 
@@ -101,12 +94,14 @@ SHA256=$(sha256sum "$CRX_OUT" | awk '{print $1}')
 echo -e "  Size: ${B}$SIZE bytes${N}"
 echo -e "  SHA256: ${B}${SHA256:0:16}...${N}"
 
-# 5. Move to releases
+# 5. Move to releases + FIX PERMISSIONS for nginx (www-data)
 mkdir -p "$RELEASES_DIR"
 mv "$CRX_OUT" "$CRX_TARGET"
-echo -e "${G}✓ $CRX_TARGET${N}"
+chmod 644 "$CRX_TARGET"
+chmod 755 "$RELEASES_DIR"
+echo -e "${G}✓ $CRX_TARGET (chmod 644, nginx-readable)${N}"
 
-# 6. Get changelog from last commit
+# 6. Get changelog
 CHANGELOG=$(git -C "$REPO_DIR" log -1 --pretty=%B 2>/dev/null | head -c 500 | tr '\n' ' ' | sed 's/"/\\"/g' || echo "Manual deploy")
 
 # 7. Register
@@ -141,5 +136,6 @@ if [ "$HTTP_CODE" = "200" ]; then
   echo -e "  URL: https://app.optimizeup.io/ext/releases/v$VERSION.crx"
 else
   echo -e "${R}⚠️  Download returned HTTP $HTTP_CODE${N}"
+  echo "Debug: sudo tail -10 /var/log/nginx/error.log"
   exit 1
 fi
