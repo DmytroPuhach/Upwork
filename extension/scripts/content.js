@@ -1,7 +1,6 @@
 
-// OptimizeUp Extension v17.0.1 — Content Script
-// Real scraping with proven Upwork selectors + multi-strategy fallback.
-// Selectors combined from v1.0.0 (tested) + modern fallbacks.
+// OptimizeUp Extension v17.0.4 — Content Script
+// Enhanced dedup (Upwork job ID extraction), budget parsing, mutex, 3s debounce.
 
 (function () {
   'use strict';
@@ -39,6 +38,7 @@
     if (/\/messages\/rooms?\/room_/.test(p)) return 'messages';
     if (/\/messages/.test(p)) return 'messages';
     if (/\/nx\/search\/jobs/.test(p)) return 'jobs_search';
+    if (/\/nx\/find-work/.test(p)) return 'jobs_search';
     if (/\/jobs\/[\w~]+/.test(p)) return 'job_detail';
     if (/\/nx\/proposals/.test(p)) return 'proposal_list';
     return 'other';
@@ -84,12 +84,30 @@
   }
 
   // ═══════════════════════════════════════════════════════════
-  // MESSAGE SELECTORS (combined from v1.0.0 tested + modern)
+  // BUDGET PARSING (new in v17.0.4)
+  // ═══════════════════════════════════════════════════════════
+
+  function parseBudget(raw) {
+    if (!raw) return { type: null, min: null, max: null };
+    const r = raw.toLowerCase();
+    const hourlyRange = r.match(/\$\s*([\d.,]+)\s*[-\u2013]\s*\$?\s*([\d.,]+)\s*(?:\/\s*h|hr|hour|hourly)/);
+    if (hourlyRange) return { type: 'hourly', min: parseFloat(hourlyRange[1].replace(/,/g, '')), max: parseFloat(hourlyRange[2].replace(/,/g, '')) };
+    const hourlySingle = r.match(/\$\s*([\d.,]+)\s*(?:\/\s*h|hr|hour|hourly)/);
+    if (hourlySingle) { const v = parseFloat(hourlySingle[1].replace(/,/g, '')); return { type: 'hourly', min: v, max: v }; }
+    const fixedRange = r.match(/\$\s*([\d.,]+)\s*[-\u2013]\s*\$?\s*([\d.,]+)/);
+    if (fixedRange) return { type: 'fixed', min: parseFloat(fixedRange[1].replace(/,/g, '')), max: parseFloat(fixedRange[2].replace(/,/g, '')) };
+    const fixedSingle = r.match(/\$\s*([\d.,]+)/);
+    if (fixedSingle) { const v = parseFloat(fixedSingle[1].replace(/,/g, '')); return { type: 'fixed', min: v, max: v }; }
+    return { type: null, min: null, max: null };
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // MESSAGE SELECTORS
   // ═══════════════════════════════════════════════════════════
 
   const MESSAGE_STRATEGIES = [
     {
-      name: 'v1-proven',  // Known-working from legacy v1.0.0
+      name: 'v1-proven',
       find: () => document.querySelectorAll(
         'p[class*="break-word"], [class*="message-body"] p, [data-test*="message"] p'
       ),
@@ -112,7 +130,7 @@
       })
     },
     {
-      name: 'air3',  // Upwork's design system
+      name: 'air3',
       find: () => document.querySelectorAll('.air3-msg-body, .air3-msg-item [class*="body"]'),
       extract: (el) => ({
         text: el.textContent?.trim(),
@@ -146,7 +164,8 @@
           description: el.querySelector('[data-test*="description"], p')?.textContent?.trim()?.substring(0, 3000),
           budget: el.querySelector('[data-test*="budget"], [data-testid*="budget"]')?.textContent?.trim(),
           country: el.querySelector('[data-test*="country"], [data-testid*="location"]')?.textContent?.trim(),
-          skills: Array.from(el.querySelectorAll('[data-test*="skill"], .air3-token')).map(s => s.textContent.trim()).filter(Boolean).slice(0, 20)
+          skills: Array.from(el.querySelectorAll('[data-test*="skill"], .air3-token')).map(s => s.textContent.trim()).filter(Boolean).slice(0, 20),
+          raw_text: el.textContent?.trim()?.substring(0, 5000)
         };
       }
     },
@@ -161,7 +180,8 @@
           description: el.querySelector('[class*="description"], p')?.textContent?.trim()?.substring(0, 3000),
           budget: el.querySelector('[class*="budget"], [class*="Budget"]')?.textContent?.trim(),
           country: el.querySelector('[class*="country"], [class*="Location"]')?.textContent?.trim(),
-          skills: Array.from(el.querySelectorAll('[class*="token"], [class*="Skill"]')).map(s => s.textContent.trim()).filter(Boolean).slice(0, 20)
+          skills: Array.from(el.querySelectorAll('[class*="token"], [class*="Skill"]')).map(s => s.textContent.trim()).filter(Boolean).slice(0, 20),
+          raw_text: el.textContent?.trim()?.substring(0, 5000)
         };
       }
     },
@@ -176,7 +196,8 @@
         return {
           title: a?.textContent?.trim(), url: a?.href,
           description: el.textContent?.trim().substring(0, 1000),
-          budget: null, country: null, skills: []
+          budget: null, country: null, skills: [],
+          raw_text: el.textContent?.trim()?.substring(0, 5000)
         };
       }
     }
@@ -190,6 +211,13 @@
       } catch (e) { warn(`Strategy ${s.name} threw:`, e.message); }
     }
     return null;
+  }
+
+  // NEW v17.0.4: Extract stable Upwork job ID from URL
+  function extractJobId(url) {
+    if (!url) return null;
+    const m = url.match(/~[\w]{15,25}/);
+    return m ? m[0] : null;
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -214,19 +242,16 @@
       try {
         const data = result.extract(el);
         if (!data.text || data.text.length < 3 || data.text.length > 5000) continue;
-        // Skip UI trash
         if (data.text === 'More options' || data.text === 'Show more' || data.text.startsWith('View ')) continue;
 
         const fingerprint = hash((roomId || clientName || 'x') + '|' + data.text.substring(0, 150));
         if (seen.has(fingerprint)) continue;
 
-        // Skip old messages on page load (>30min)
         if (data.timestamp) {
           const age = Date.now() - new Date(data.timestamp).getTime();
           if (age > 30 * 60 * 1000) { addSeen('messages', fingerprint); continue; }
         }
 
-        // Skip own messages (outbound)
         if (data.is_own) { addSeen('messages', fingerprint); continue; }
 
         addSeen('messages', fingerprint);
@@ -253,53 +278,72 @@
   }
 
   // ═══════════════════════════════════════════════════════════
-  // JOB CARDS HANDLER
+  // JOB CARDS HANDLER — v17.0.4 enhanced dedup + mutex
   // ═══════════════════════════════════════════════════════════
 
+  let jobsInFlight = false;
+
   async function handleJobCards() {
-    if (!/\/nx\/search\/jobs/.test(location.pathname)) return;
+    if (jobsInFlight) return;
+    if (!/\/nx\/(search\/jobs|find-work)/.test(location.pathname)) return;
 
     const { cachedIdentity } = await chrome.storage.local.get('cachedIdentity');
-    if (!cachedIdentity?.member?.is_bidding_enabled) return;  // Dima=lead skips
+    if (!cachedIdentity?.member?.is_bidding_enabled) return;
 
-    const result = tryStrategies(JOB_STRATEGIES, 3);
-    if (!result) {
-      const sample = document.querySelector('main')?.outerHTML || document.body?.outerHTML?.substring(0, 10000);
-      reportBroken('jobs_search', sample);
-      return;
-    }
-
-    const seen = getSeenSet('jobs');
-    const newJobs = [];
-
-    for (const el of result.elements) {
-      try {
-        const data = result.extract(el);
-        if (!data.title || !data.url) continue;
-        const jobId = data.url.match(/~[\w]+/)?.[0] || hash(data.url);
-        if (seen.has(jobId)) continue;
-
-        addSeen('jobs', jobId);
-        newJobs.push({
-          upwork_id: jobId, title: data.title.substring(0, 500), url: data.url,
-          description: (data.description || '').substring(0, 5000),
-          budget_raw: data.budget, client_country: data.country,
-          skills: data.skills || []
-        });
-      } catch (e) { warn('Job extract error:', e); }
-    }
-
-    if (newJobs.length > 0) {
-      log(`💼 ${newJobs.length} new jobs via ${result.strategy}`);
-      reportSuccess('jobs_search', result.strategy, result.elements.length);
-      for (const j of newJobs.slice(0, 5)) {
-        chrome.runtime.sendMessage({ type: 'JOB_SCRAPED', payload: j }).catch(() => {});
+    jobsInFlight = true;
+    try {
+      const result = tryStrategies(JOB_STRATEGIES, 3);
+      if (!result) {
+        const sample = document.querySelector('main')?.outerHTML || document.body?.outerHTML?.substring(0, 10000);
+        reportBroken('jobs_search', sample);
+        return;
       }
+
+      const seen = getSeenSet('jobs');
+      const newJobs = [];
+
+      for (const el of result.elements) {
+        try {
+          const data = result.extract(el);
+          if (!data.title || !data.url) continue;
+
+          const upworkId = extractJobId(data.url);
+          const fingerprint = upworkId || hash((data.title || '').substring(0, 100) + '|' + (data.url || '').substring(0, 200));
+          if (seen.has(fingerprint)) continue;
+
+          addSeen('jobs', fingerprint);
+
+          const budget = parseBudget(data.budget || data.raw_text || '');
+
+          newJobs.push({
+            upwork_id: upworkId || fingerprint,
+            title: data.title.substring(0, 500),
+            url: data.url,
+            description: (data.description || data.raw_text || '').substring(0, 5000),
+            budget_raw: data.budget,
+            budget_type: budget.type,
+            budget_min: budget.min,
+            budget_max: budget.max,
+            client_country: data.country,
+            skills: data.skills || []
+          });
+        } catch (e) { warn('Job extract error:', e); }
+      }
+
+      if (newJobs.length > 0) {
+        log(`💼 ${newJobs.length} new jobs via ${result.strategy}`);
+        reportSuccess('jobs_search', result.strategy, result.elements.length);
+        for (const j of newJobs.slice(0, 10)) {
+          chrome.runtime.sendMessage({ type: 'JOB_SCRAPED', payload: j }).catch(() => {});
+        }
+      }
+    } finally {
+      jobsInFlight = false;
     }
   }
 
   // ═══════════════════════════════════════════════════════════
-  // OBSERVERS & SPA NAVIGATION
+  // OBSERVERS — 3s debounce in v17.0.4 (was 1.5s)
   // ═══════════════════════════════════════════════════════════
 
   let debounceTimer = null;
@@ -309,7 +353,7 @@
       const pt = getPageType();
       if (pt === 'messages') handleMessages();
       else if (pt === 'jobs_search') handleJobCards();
-    }, 1500);
+    }, 3000);
   }
 
   const observer = new MutationObserver((mutations) => {
@@ -327,13 +371,11 @@
     } catch (e) { warn('Observer start failed:', e); }
   }
 
-  // SPA navigation watcher
   let lastUrl = location.href;
   setInterval(() => {
     if (location.href !== lastUrl) { lastUrl = location.href; debouncedRun(); }
   }, 1000);
 
-  // Periodic safety re-check
   setInterval(() => debouncedRun(), 30000);
 
   if (document.readyState === 'complete' || document.readyState === 'interactive') {
