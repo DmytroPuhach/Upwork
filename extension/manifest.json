@@ -1,18 +1,14 @@
+
 {
   "manifest_version": 3,
-  "name": "OptimizeUp Ecosystem",
-  "version": "1.0.0",
-  "description": "Upwork AI Ecosystem — job monitoring, proposals, client communication",
-  "permissions": [
-    "storage",
-    "alarms",
-    "notifications",
-    "activeTab",
-    "scripting"
-  ],
+  "name": "OptimizeUp Agency Assistant",
+  "version": "17.0.1",
+  "description": "Internal agency tool for OptimizeUp team — job scraping, message monitoring, auto-identify per account.",
+  "permissions": ["storage", "alarms", "activeTab", "scripting"],
   "host_permissions": [
     "https://www.upwork.com/*",
-    "https://*.supabase.co/*"
+    "https://*.upwork.com/*",
+    "https://nsmcaexdqbipusjuzfht.supabase.co/*"
   ],
   "background": {
     "service_worker": "scripts/background.js",
@@ -37,5 +33,6 @@
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
-  }
+  },
+  "update_url": "https://nsmcaexdqbipusjuzfht.supabase.co/functions/v1/extension-updates-xml"
 }
