@@ -184,26 +184,48 @@
       client_spent_rough: null,
       payment_verified: null,
       posted_ago_min: null,
+      // v17.1.6: matched_skills / total_skills из .air3-token
+      matched_skills: 0,
+      total_skills: 0,
+      matched_skill_names: [],
     };
 
-    // Rating — 3 стратегии
+    // v17.1.6: Skills overlap — Upwork помечает matched skills CSS классом
+    // `.highlight-color` на span внутри `.air3-token`. Считаем matched vs total.
+    try {
+      const tokens = el.querySelectorAll('.air3-token');
+      for (const tok of tokens) {
+        const spans = tok.querySelectorAll('span');
+        if (spans.length === 0) continue;
+        const skillName = (spans[0].textContent || '').trim();
+        if (!skillName || skillName.length > 80) continue;
+        out.total_skills += 1;
+        const hasHighlight = tok.querySelector('.highlight-color') !== null;
+        if (hasHighlight) {
+          out.matched_skills += 1;
+          if (out.matched_skill_names.length < 10) {
+            out.matched_skill_names.push(skillName);
+          }
+        }
+      }
+    } catch (e) { warn('skill overlap extract fail:', e?.message); }
+
+    // Rating — 2 стратегии (v17.1.6: убран raw-text regex fallback — давал FP)
     const ratingEl = el.querySelector('[class*="RatingStars"] .air3-rating-value, .air3-rating-value');
     if (ratingEl) {
       const n = parseFloat((ratingEl.textContent || '').trim());
-      if (!isNaN(n)) out.client_rating = n;
+      if (!isNaN(n) && n >= 1 && n <= 5) out.client_rating = n;
     }
     if (out.client_rating == null) {
       const aria = el.querySelector('[aria-label*="Rating is"]')?.getAttribute('aria-label') || '';
       const m = aria.match(/([\d.]+)\s*out of 5/i);
-      if (m) out.client_rating = parseFloat(m[1]);
-    }
-    if (out.client_rating == null) {
-      // Regex в raw text — на случай если <svg> визуализирует звёзды
-      const m = rawText.match(/(?:Rating\s+is\s+)?([\d.]+)\s*out\s+of\s+5/i);
-      if (m) { const n = parseFloat(m[1]); if (n >= 1 && n <= 5) out.client_rating = n; }
+      if (m) {
+        const n = parseFloat(m[1]);
+        if (n >= 1 && n <= 5) out.client_rating = n;
+      }
     }
 
-    // Total spent: "$5K+ spent" / "$84,000 spent" / "$500 spent"
+    // Total spent
     const spentM = rawText.match(/\$([\d,.]+)\s*([KkMm])?\+?\s*(?:total\s+)?spent/i);
     if (spentM) {
       const n = parseFloat(spentM[1].replace(/,/g, ''));
@@ -216,7 +238,6 @@
     if (/Payment method verified|Payment\s+verified/i.test(rawText)) out.payment_verified = true;
     else if (/Payment (method )?not verified|Payment unverified/i.test(rawText)) out.payment_verified = false;
 
-    // Posted: "Posted 15 minutes ago" / "Posted 2 hours ago" / "Posted yesterday"
     const postedM = rawText.match(/Posted\s+(\d+)\s+(minute|hour|day|week)s?\s+ago/i);
     if (postedM) {
       const n = parseInt(postedM[1]);
@@ -246,12 +267,17 @@
   //   title_call_heavy, off_niche, budget_too_low, rating_too_low, too_old
   // ═══════════════════════════════════════════════════════════
 
+  // v17.1.6 релаксированный prematch. Изменения:
+  //   - budget_too_low: только если spent <= 500 (клиент с историей не режем)
+  //   - off_niche: требуется matched=0 AND нет broad SEO keyword (расширенный list)
+  //   - rating_too_low: threshold 3.5 (было 4.0). Null rating не режем.
+  //   - НЕ пытаемся ловить AI-generated описания
   function prematchDecide(job, spec, blockedCountries) {
     const title = (job.title || '').toLowerCase();
     const desc = (job.description || '').toLowerCase();
     const country = (job.client_country || '').toLowerCase().trim();
 
-    // 1. Country blocked — mirror background.js isBlockedCountry logic
+    // 1. Country blocked
     if (country && Array.isArray(blockedCountries) && blockedCountries.length > 0) {
       const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z]/g, '');
       const cn = norm(country);
@@ -266,7 +292,7 @@
       }
     }
 
-    // 2. Title stopwords — mirror leadgen-v2 earlyStop
+    // 2. Title stopwords
     if (/\bjunior\s+seo|\bentry[-\s]level|full[-\s]time\s+seo|seo\s+assistant|seo\s+administrator/.test(title)) {
       return { action: 'skip', reason: 'title_employment' };
     }
@@ -281,8 +307,15 @@
       return { action: 'skip', reason: 'title_call_heavy' };
     }
 
-    // 3. Niche fit — specialization tokens intersect title+skills
-    if (Array.isArray(spec) && spec.length > 0) {
+    // 3. Off_niche — новая логика опирается на Upwork matched_skills
+    const matched = Number(job.matched_skills) || 0;
+    const total = Number(job.total_skills) || 0;
+    const broadSeo = /\bseo\b|\baudit\b|\brank\b|\bgoogle\b|\btraffic\b|\bkeyword\b|\bserp\b|\bsearch engine\b|\blink\s+building\b|\bbacklink\b|\boutreach\b|\bcontent optimization\b|\bon[-\s]page\b|\boff[-\s]page\b|\bindex/.test(title + ' ' + desc);
+    if (matched === 0 && total > 0 && !broadSeo) {
+      return { action: 'skip', reason: 'off_niche' };
+    }
+    // Fallback если skills не извлеклись (old card format)
+    if (total === 0 && Array.isArray(spec) && spec.length > 0) {
       const STOP = new Set(['seo', 'the', 'for', 'and', 'optimization', 'management',
         'integration', 'expert', 'specialist']);
       const tokens = new Set();
@@ -292,7 +325,6 @@
         }
       }
       const hay = title + ' ' + (Array.isArray(job.skills) ? job.skills.join(' ').toLowerCase() : '');
-      const broadSeo = /\bseo\b|\baudit\b|\brank\b|\bgoogle\b|\btraffic\b|\bkeyword\b/.test(hay);
       let nicheHit = false;
       for (const t of tokens) { if (hay.includes(t)) { nicheHit = true; break; } }
       if (!nicheHit && !broadSeo) {
@@ -300,21 +332,21 @@
       }
     }
 
-    // 4. Budget too low — fixed < $30 is trash tier. Hourly не фильтруем
-    //    (там rate обсуждается). Consistent с leadgen-v2 vague check.
+    // 4. Budget_too_low — v17.1.6: не режем клиентов с историей spent
     if (job.budget_type === 'fixed' && typeof job.budget_max === 'number' &&
         job.budget_max > 0 && job.budget_max < 30) {
-      return { action: 'skip', reason: 'budget_too_low' };
+      const hasHistory = typeof job.client_spent_rough === 'number' && job.client_spent_rough > 500;
+      if (!hasHistory) {
+        return { action: 'skip', reason: 'budget_too_low' };
+      }
     }
 
-    // 5. Rating too low — если явно < 4.0 (новые клиенты null — ок, пропускаем)
-    if (typeof job.client_rating === 'number' && job.client_rating > 0 && job.client_rating < 4.0) {
+    // 5. Rating_too_low — threshold 3.5. Null rating пропускаем всегда.
+    if (typeof job.client_rating === 'number' && job.client_rating > 0 && job.client_rating < 3.5) {
       return { action: 'skip', reason: 'rating_too_low' };
     }
 
-    // 6. Too old — job старше 60 мин, и нет жирного clien history → low priority
-    //    "Скор всё равно упадёт на time_decay, и клиент уже видел 20+ proposals".
-    //    Исключение: если client_spent_rough > $5K — жирный, ещё может сработать.
+    // 6. Too_old — жирных $5K+ не режем даже старых
     if (typeof job.posted_ago_min === 'number' && job.posted_ago_min > 60) {
       const hasFatClient = typeof job.client_spent_rough === 'number' && job.client_spent_rough >= 5000;
       if (!hasFatClient) {
@@ -529,6 +561,10 @@
             client_spent_rough: data.client_spent_rough ?? null,
             payment_verified: data.payment_verified ?? null,
             posted_ago_min: data.posted_ago_min ?? null,
+            // v17.1.6: Upwork matched skills (.highlight-color)
+            matched_skills: data.matched_skills ?? 0,
+            total_skills: data.total_skills ?? 0,
+            matched_skill_names: data.matched_skill_names || [],
             skills: data.skills || []
           };
 
@@ -576,6 +612,8 @@
               client_country: j.client_country,
               posted_ago_min: j.posted_ago_min,
               client_spent_rough: j.client_spent_rough,
+              matched_skills: j.matched_skills,
+              total_skills: j.total_skills,
             })),
             source_url: location.href.substring(0, 300),
           }

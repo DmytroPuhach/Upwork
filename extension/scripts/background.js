@@ -294,8 +294,11 @@ async function setQueue(q) {
 //   - 1000 если client_spent_rough >= $5K (жирный клиент в приоритете)
 //   - 500  если client_spent_rough >= $1K
 //   unknown posted_ago_min → 15 (предполагаем свежак от scraper)
+// v17.1.6: priority с учётом matched_skills
 function computePriority(item) {
   let prio = typeof item.posted_ago_min === 'number' ? item.posted_ago_min : 15;
+  const matched = Number(item.matched_skills) || 0;
+  prio -= matched * 200;
   const spent = item.client_spent_rough;
   if (typeof spent === 'number') {
     if (spent >= 5000) prio -= 1000;
@@ -319,6 +322,8 @@ async function enqueueForEnrichment(items) {
       // v17.1.5: запоминаем метрики для prio-sort и потом в pipeline
       posted_ago_min: typeof it.posted_ago_min === 'number' ? it.posted_ago_min : null,
       client_spent_rough: typeof it.client_spent_rough === 'number' ? it.client_spent_rough : null,
+      matched_skills: Number(it.matched_skills) || 0,
+      total_skills: Number(it.total_skills) || 0,
       priority: computePriority(it),
       queued_at: Date.now(),
       attempts: 0,
@@ -332,7 +337,10 @@ async function enqueueForEnrichment(items) {
   q.sort((a, b) => (a.priority ?? 9999) - (b.priority ?? 9999));
   await setQueue(q);
   if (addedIds.length > 0) {
-    const sample = q.slice(0, 3).map(x => `${x.title?.substring(0,30)}(prio=${x.priority})`).join(' | ');
+    const sample = q.slice(0, 3).map(x => {
+      const sk = x.matched_skills ? ` · 🎯${x.matched_skills}` : '';
+      return `${x.title?.substring(0, 25)}(p=${x.priority}${sk})`;
+    }).join(' | ');
     console.log(`[OU enrich] +${addedIds.length} queued, total ${q.length}. Top: ${sample}`);
   }
   return addedIds;
@@ -596,6 +604,8 @@ async function processOneJob(item) {
           machine_id: machineId,
           account_slug: cachedIdentity?.member?.slug,
           enrichment: payload,
+          matched_skills: Number(item.matched_skills) || 0,
+          total_skills: Number(item.total_skills) || 0,
         }),
       });
       const data = await res.json().catch(() => ({}));
@@ -886,6 +896,9 @@ async function handleScrapedJobSkip(payload) {
     ingest_only: true,
     prematch_reason: reason,
     prematch_score: payload.prematch_score ?? 0,
+    // v17.1.6: Upwork skill-overlap
+    matched_skills: Number(payload.matched_skills) || 0,
+    total_skills: Number(payload.total_skills) || 0,
   };
 
   fetch(`${SB_URL}/functions/v1/leadgen-v2`, {
@@ -929,6 +942,9 @@ async function handleScrapedJob(payload) {
     machine_id: machineId,
     job: payload,
     ingest_only: true,
+    // v17.1.6: Upwork skill-overlap
+    matched_skills: Number(payload.matched_skills) || 0,
+    total_skills: Number(payload.total_skills) || 0,
   };
   if (countryBlocked) {
     body.prematch_reason = 'country';
@@ -1213,13 +1229,72 @@ async function maybeRunProfileSync() {
 // ALARMS
 // ═══════════════════════════════════════════════════════════
 
-chrome.runtime.onInstalled.addListener(async () => {
-  console.log('[OU] Installed — setting up alarms');
+// v17.1.6 — SEARCH QUERY ROTATION (default OFF, opt-in)
+const SEARCH_ROTATION = ['seo', 'Technical SEO', 'SEO audit', 'Shopify SEO', 'On-Page SEO'];
+const SEARCH_ROTATION_MIN_GAP_MIN = 55;
+const SEARCH_USER_IDLE_MIN = 10;
+
+async function maybeRotateSearch() {
+  try {
+    const { pausedUntilUpdate, searchRotationLastAt, searchRotationIndex,
+            searchRotationEnabled } = await chrome.storage.local.get([
+      'pausedUntilUpdate', 'searchRotationLastAt', 'searchRotationIndex',
+      'searchRotationEnabled'
+    ]);
+
+    // DEFAULT OFF. Включить: chrome.storage.local.set({searchRotationEnabled: true})
+    if (searchRotationEnabled !== true) return;
+    if (pausedUntilUpdate) return;
+
+    const nowMs = Date.now();
+    if (searchRotationLastAt && (nowMs - searchRotationLastAt) < SEARCH_ROTATION_MIN_GAP_MIN * 60000) return;
+
+    const tabs = await chrome.tabs.query({ url: 'https://www.upwork.com/nx/search/jobs/*' });
+    if (tabs.length === 0) return;
+    const tab = tabs[0];
+
+    if (tab.lastAccessed && (nowMs - tab.lastAccessed) < SEARCH_USER_IDLE_MIN * 60000) {
+      console.log('[OU search-rotate] user active in tab, skip cycle');
+      return;
+    }
+
+    const idx = typeof searchRotationIndex === 'number' ? searchRotationIndex : 0;
+    const nextIdx = (idx + 1) % SEARCH_ROTATION.length;
+    const nextQuery = SEARCH_ROTATION[nextIdx];
+
+    const newUrl = 'https://www.upwork.com/nx/search/jobs/?q=' + encodeURIComponent(nextQuery) + '&sort=recency';
+    await chrome.tabs.update(tab.id, { url: newUrl });
+
+    await chrome.storage.local.set({
+      searchRotationIndex: nextIdx,
+      searchRotationLastAt: nowMs,
+      searchRotationLastQuery: nextQuery,
+    });
+
+    console.log('[OU search-rotate] ' + SEARCH_ROTATION[idx] + ' -> ' + nextQuery);
+  } catch (e) {
+    console.warn('[OU search-rotate] error:', e?.message);
+  }
+}
+
+chrome.runtime.onInstalled.addListener(async (details) => {
+  console.log('[OU] Installed — setting up alarms, reason=', details?.reason);
   await chrome.alarms.clearAll();
   chrome.alarms.create('heartbeat', { periodInMinutes: 2 });
   chrome.alarms.create('daily-reset', { periodInMinutes: 60 });
   chrome.alarms.create('enrich-drain', { periodInMinutes: 1 });
-  chrome.alarms.create('profile-sync-check', { periodInMinutes: 10 });  // v17.1.4
+  chrome.alarms.create('profile-sync-check', { periodInMinutes: 10 });
+  chrome.alarms.create('search-rotate', { periodInMinutes: 15 });  // v17.1.6
+
+  // v17.1.6: clear stale enrichQueue при upgrade
+  if (details?.reason === 'update' || details?.reason === 'install') {
+    const { enrichQueue } = await chrome.storage.local.get('enrichQueue');
+    if (Array.isArray(enrichQueue) && enrichQueue.length > 0) {
+      console.log('[OU upgrade] clearing stale enrichQueue (' + enrichQueue.length + ' items)');
+      await chrome.storage.local.set({ enrichQueue: [] });
+    }
+  }
+
   await identify();
   await dailyReset();
   await heartbeat();
@@ -1232,6 +1307,7 @@ chrome.runtime.onStartup.addListener(async () => {
   chrome.alarms.create('daily-reset', { periodInMinutes: 60 });
   chrome.alarms.create('enrich-drain', { periodInMinutes: 1 });
   chrome.alarms.create('profile-sync-check', { periodInMinutes: 10 });  // v17.1.4
+  chrome.alarms.create('search-rotate', { periodInMinutes: 15 });  // v17.1.6
   await identify();
   await dailyReset();
   await heartbeat();
@@ -1242,6 +1318,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === 'daily-reset') await dailyReset();
   if (alarm.name === 'enrich-drain') await maybeProcessEnrichQueue();
   if (alarm.name === 'profile-sync-check') await maybeRunProfileSync();  // v17.1.4
+  if (alarm.name === 'search-rotate') await maybeRotateSearch();  // v17.1.6
 });
 
 (async () => {
