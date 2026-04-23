@@ -16,7 +16,7 @@ console.log('[OU] Background loaded — version', EXT_VERSION);
 // ═══════════════════════════════════════════════════════════
 
 const ENRICH_MAX_QUEUE = 50;                  // cap in-memory queue size
-const ENRICH_MAX_PER_HOUR = 5;                // hard rate cap
+const ENRICH_MAX_PER_HOUR = 8;                // v17.1.7: was 5, +60% throughput
 // v17.1.2: human read/click cadence. Distribution approximates a real freelancer:
 // most opens 30-75s apart, sometimes slower, and ~5% "long pause" (3-5 min)
 // simulating distraction / coffee break. Gives avg ~75s between opens.
@@ -294,9 +294,18 @@ async function setQueue(q) {
 //   - 1000 если client_spent_rough >= $5K (жирный клиент в приоритете)
 //   - 500  если client_spent_rough >= $1K
 //   unknown posted_ago_min → 15 (предполагаем свежак от scraper)
-// v17.1.6: priority с учётом matched_skills
+// v17.1.7: FRESH FIRST. По бизнес-данным Димы: первый подавшийся = ~80%
+// успеха. Всё остальное второстепенно. Свежаки <10 мин получают mega-boost
+// (-9999) и обгоняют всю очередь независимо от matching/spent. Старые —
+// сортируются по matched_skills и spent как раньше.
 function computePriority(item) {
-  let prio = typeof item.posted_ago_min === 'number' ? item.posted_ago_min : 15;
+  const age = typeof item.posted_ago_min === 'number' ? item.posted_ago_min : 15;
+
+  // Fresh lane: <10 min — прямой аванс перед всеми остальными.
+  if (age <= 10) return -9999 + age;  // -9999..-9989 для очередности по свежести
+
+  // Обычный расчёт
+  let prio = age;
   const matched = Number(item.matched_skills) || 0;
   prio -= matched * 200;
   const spent = item.client_spent_rough;
