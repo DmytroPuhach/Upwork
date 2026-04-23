@@ -288,6 +288,22 @@ async function setQueue(q) {
   await chrome.storage.local.set({ enrichQueue: q.slice(0, ENRICH_MAX_QUEUE) });
 }
 
+// v17.1.5: priority score — lower is better (обработается раньше).
+// Formula:
+//   base = posted_ago_min (свежак → маленький скор → в начало)
+//   - 1000 если client_spent_rough >= $5K (жирный клиент в приоритете)
+//   - 500  если client_spent_rough >= $1K
+//   unknown posted_ago_min → 15 (предполагаем свежак от scraper)
+function computePriority(item) {
+  let prio = typeof item.posted_ago_min === 'number' ? item.posted_ago_min : 15;
+  const spent = item.client_spent_rough;
+  if (typeof spent === 'number') {
+    if (spent >= 5000) prio -= 1000;
+    else if (spent >= 1000) prio -= 500;
+  }
+  return prio;
+}
+
 async function enqueueForEnrichment(items) {
   const q = await getQueue();
   const seen = new Set(q.map(x => x.upwork_id));
@@ -300,14 +316,25 @@ async function enqueueForEnrichment(items) {
       url: normalizeJobUrl(it.url),
       title: (it.title || '').substring(0, 200),
       skills: (it.skills || []).slice(0, 10),
+      // v17.1.5: запоминаем метрики для prio-sort и потом в pipeline
+      posted_ago_min: typeof it.posted_ago_min === 'number' ? it.posted_ago_min : null,
+      client_spent_rough: typeof it.client_spent_rough === 'number' ? it.client_spent_rough : null,
+      priority: computePriority(it),
       queued_at: Date.now(),
       attempts: 0,
     });
     seen.add(it.upwork_id);
     addedIds.push(it.upwork_id);
   }
+  // v17.1.5: сортируем всю очередь по priority ASC (fresh + fat first).
+  // stale + light уходят в конец — их либо съест следующий час, либо вытеснят
+  // новые поступления.
+  q.sort((a, b) => (a.priority ?? 9999) - (b.priority ?? 9999));
   await setQueue(q);
-  if (addedIds.length > 0) console.log(`[OU enrich] +${addedIds.length} queued, total ${q.length}`);
+  if (addedIds.length > 0) {
+    const sample = q.slice(0, 3).map(x => `${x.title?.substring(0,30)}(prio=${x.priority})`).join(' | ');
+    console.log(`[OU enrich] +${addedIds.length} queued, total ${q.length}. Top: ${sample}`);
+  }
   return addedIds;
 }
 
@@ -624,6 +651,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     handleScrapedJob(msg.payload).then(r => sendResponse(r)).catch(e => sendResponse({ error: String(e) }));
     return true;
   }
+  // v17.1.5: jobs которые content.js prematch'нул. Не идут в enrichment queue,
+  // пишутся сразу в match_scores как skip с причиной.
+  if (msg?.type === 'JOB_SCRAPED_SKIP') {
+    handleScrapedJobSkip(msg.payload).then(r => sendResponse(r)).catch(e => sendResponse({ error: String(e) }));
+    return true;
+  }
   if (msg?.type === 'JOBS_CANDIDATES') {
     handleJobsCandidates(msg.payload).then(r => sendResponse(r)).catch(e => sendResponse({ error: String(e) }));
     return true;
@@ -824,6 +857,50 @@ function isBlockedCountry(jobCountry, blockedList) {
   return false;
 }
 
+// v17.1.5: когда content.js prematch'нул job — шлём в leadgen-v2 с
+// prematch_reason, но БЕЗ enrichment queue. В дашборде сразу видно
+// "skip: country" / "skip: off_niche" / etc. вместо молчаливого pending.
+async function handleScrapedJobSkip(payload) {
+  const { cachedIdentity, machineId, pausedUntilUpdate } = await chrome.storage.local.get([
+    'cachedIdentity', 'machineId', 'pausedUntilUpdate'
+  ]);
+  if (pausedUntilUpdate) return { skipped: 'paused_for_update' };
+  if (!cachedIdentity?.member?.is_bidding_enabled) return { skipped: 'bidding_disabled' };
+
+  const reason = payload.prematch_reason || 'unknown';
+  const body = {
+    account_slug: cachedIdentity.member.slug,
+    machine_id: machineId,
+    job: {
+      upwork_id: payload.upwork_id,
+      title: payload.title,
+      url: payload.url,
+      description: payload.description || '',
+      budget_type: payload.budget_type,
+      budget_min: payload.budget_min,
+      budget_max: payload.budget_max,
+      client_country: payload.client_country,
+      client_rating: payload.client_rating,
+      skills: payload.skills || [],
+    },
+    ingest_only: true,
+    prematch_reason: reason,
+    prematch_score: payload.prematch_score ?? 0,
+  };
+
+  fetch(`${SB_URL}/functions/v1/leadgen-v2`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+  }).catch(() => {});
+
+  // Still increment today's counter — the job WAS scraped, just not pursued
+  const today = new Date().toDateString();
+  const stored = await chrome.storage.local.get(['jobsScrapedToday', 'countsDate']);
+  const count = (stored.countsDate === today) ? (stored.jobsScrapedToday || 0) + 1 : 1;
+  await chrome.storage.local.set({ jobsScrapedToday: count, countsDate: today });
+
+  return { ok: true, skipped_reason: reason, upwork_id: payload.upwork_id };
+}
+
 async function handleScrapedJob(payload) {
   // v17.1.3: pre-match skip on search page. If job's country is in
   // account.blocked_countries — still call leadgen-v2 with ingest_only, but
@@ -917,28 +994,30 @@ async function handleJobsCandidates(payload) {
   const { cachedIdentity } = await chrome.storage.local.get('cachedIdentity');
   if (!cachedIdentity?.member?.is_bidding_enabled) return { skipped: 'bidding_disabled' };
 
-  // v17.1.3: strip blocked-country jobs BEFORE enrichment prerank.
-  // Search-page client_country is often reliable enough to catch obvious
-  // blocks (India, Pakistan). If blocked, skip enrichment entirely — the
-  // JOB_SCRAPED path will still ingest the row with prematch_reason='country'
-  // so the dashboard shows why we passed.
+  // v17.1.5: blocked-country filter теперь делается в content.js prematchDecide
+  // (с шансом попасть в match_scores как 'skip: country'). Здесь дубликатный
+  // guard на случай если client_country пришла не из content.js (defensive).
   const blocked = cachedIdentity.account?.blocked_countries
                || cachedIdentity.member?.blocked_countries
                || [];
   const filtered = jobs.filter(j => !isBlockedCountry(j.client_country, blocked));
   const stripped = jobs.length - filtered.length;
-  if (stripped > 0) console.log(`[OU enrich] prematch filter: ${stripped} blocked-country jobs skipped`);
 
   if (filtered.length === 0) return { ok: true, enqueued: 0, stripped_blocked: stripped };
 
   const spec = cachedIdentity.account?.specialization || cachedIdentity.member?.specialization || [];
   const top = prerank(filtered, spec);
 
+  // v17.1.5: передаём posted_ago_min + client_spent_rough в очередь,
+  // чтобы enqueueForEnrichment() мог отсортировать по приоритету
+  // (свежие + жирные клиенты первые).
   const addedIds = await enqueueForEnrichment(top.map(j => ({
     upwork_id: j.upwork_id,
     url: j.url,
     title: j.title,
     skills: j.skills,
+    posted_ago_min: j.posted_ago_min ?? null,
+    client_spent_rough: j.client_spent_rough ?? null,
   })));
 
   maybeProcessEnrichQueue().catch(() => {});
