@@ -267,17 +267,27 @@
   //   title_call_heavy, off_niche, budget_too_low, rating_too_low, too_old
   // ═══════════════════════════════════════════════════════════
 
-  // v17.1.6 релаксированный prematch. Изменения:
-  //   - budget_too_low: только если spent <= 500 (клиент с историей не режем)
-  //   - off_niche: требуется matched=0 AND нет broad SEO keyword (расширенный list)
-  //   - rating_too_low: threshold 3.5 (было 4.0). Null rating не режем.
-  //   - НЕ пытаемся ловить AI-generated описания
+  // v17.1.7 philosophy: SPEED > PRECISION. Первый подавшийся на job получает
+  // ~80% успеха — по бизнес-данным Димы. Prematch режет ТОЛЬКО абсолютные
+  // no-go (country, employment, agency, pure content). Всё сомнительное
+  // (низкий budget + matching, off-niche без skills, etc) → идёт в Match Agent
+  // который читает full description и решает обоснованно.
+  //
+  // Изменения от v17.1.6:
+  //   - budget_too_low РЕЖЕМ только если matched=0 AND нет broadSeo keyword
+  //   - off_niche: если total=0 AND matched=0 (chips не извлечены) → НЕ режем
+  //   - off_niche fallback по title tokens — сохраняем, но только если total=0
+  //     AND нет broadSeo AND niche вообще не пересекается со spec
   function prematchDecide(job, spec, blockedCountries) {
     const title = (job.title || '').toLowerCase();
     const desc = (job.description || '').toLowerCase();
     const country = (job.client_country || '').toLowerCase().trim();
 
-    // 1. Country blocked
+    const matched = Number(job.matched_skills) || 0;
+    const total = Number(job.total_skills) || 0;
+    const broadSeo = /\bseo\b|\baudit\b|\brank\b|\bgoogle\b|\btraffic\b|\bkeyword\b|\bserp\b|\bsearch engine\b|\blink\s+building\b|\bbacklink\b|\boutreach\b|\bcontent optimization\b|\bon[-\s]page\b|\boff[-\s]page\b|\bindex/.test(title + ' ' + desc);
+
+    // 1. Country blocked — hard no-go
     if (country && Array.isArray(blockedCountries) && blockedCountries.length > 0) {
       const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z]/g, '');
       const cn = norm(country);
@@ -292,7 +302,7 @@
       }
     }
 
-    // 2. Title stopwords
+    // 2. Title stopwords — hard no-go (employment / agency / pure_content / call_heavy)
     if (/\bjunior\s+seo|\bentry[-\s]level|full[-\s]time\s+seo|seo\s+assistant|seo\s+administrator/.test(title)) {
       return { action: 'skip', reason: 'title_employment' };
     }
@@ -307,49 +317,36 @@
       return { action: 'skip', reason: 'title_call_heavy' };
     }
 
-    // 3. Off_niche — новая логика опирается на Upwork matched_skills
-    const matched = Number(job.matched_skills) || 0;
-    const total = Number(job.total_skills) || 0;
-    const broadSeo = /\bseo\b|\baudit\b|\brank\b|\bgoogle\b|\btraffic\b|\bkeyword\b|\bserp\b|\bsearch engine\b|\blink\s+building\b|\bbacklink\b|\boutreach\b|\bcontent optimization\b|\bon[-\s]page\b|\boff[-\s]page\b|\bindex/.test(title + ' ' + desc);
-    if (matched === 0 && total > 0 && !broadSeo) {
+    // 3. Off_niche — режем ТОЛЬКО если skills извлечены AND matched=0 AND title без broadSeo
+    // Если chips не извлеклись (total=0) — НЕ режем, пусть Match Agent решает с full desc.
+    if (total > 0 && matched === 0 && !broadSeo) {
       return { action: 'skip', reason: 'off_niche' };
     }
-    // Fallback если skills не извлеклись (old card format)
-    if (total === 0 && Array.isArray(spec) && spec.length > 0) {
-      const STOP = new Set(['seo', 'the', 'for', 'and', 'optimization', 'management',
-        'integration', 'expert', 'specialist']);
-      const tokens = new Set();
-      for (const phrase of spec) {
-        for (const w of String(phrase).toLowerCase().split(/[\s\-\/,]+/).filter(Boolean)) {
-          if (w.length >= 3 && !STOP.has(w)) tokens.add(w);
-        }
-      }
-      const hay = title + ' ' + (Array.isArray(job.skills) ? job.skills.join(' ').toLowerCase() : '');
-      let nicheHit = false;
-      for (const t of tokens) { if (hay.includes(t)) { nicheHit = true; break; } }
-      if (!nicheHit && !broadSeo) {
-        return { action: 'skip', reason: 'off_niche' };
-      }
-    }
 
-    // 4. Budget_too_low — v17.1.6: не режем клиентов с историей spent
+    // 4. Budget_too_low — режем только если НЕТ matching signals AND budget мусорный
+    // v17.1.7: свежак с matched_skills>=2 может быть "пробный туз" клиента с низким
+    // budget — ты первый, offer roadmap для большого проекта, входишь в контракт.
+    // Не режем если есть ЛЮБОЙ positive signal.
     if (job.budget_type === 'fixed' && typeof job.budget_max === 'number' &&
         job.budget_max > 0 && job.budget_max < 30) {
       const hasHistory = typeof job.client_spent_rough === 'number' && job.client_spent_rough > 500;
-      if (!hasHistory) {
+      const hasMatching = matched >= 1;  // Upwork сам отметил skill overlap
+      const hasBroadSeo = broadSeo;      // title/desc упоминает SEO
+      if (!hasHistory && !hasMatching && !hasBroadSeo) {
         return { action: 'skip', reason: 'budget_too_low' };
       }
     }
 
-    // 5. Rating_too_low — threshold 3.5. Null rating пропускаем всегда.
+    // 5. Rating_too_low — режем только явно низкий (<3.5). Null rating пропускаем.
     if (typeof job.client_rating === 'number' && job.client_rating > 0 && job.client_rating < 3.5) {
       return { action: 'skip', reason: 'rating_too_low' };
     }
 
-    // 6. Too_old — жирных $5K+ не режем даже старых
+    // 6. Too_old — режем только если >60 мин AND нет жирного клиента AND нет matching
     if (typeof job.posted_ago_min === 'number' && job.posted_ago_min > 60) {
       const hasFatClient = typeof job.client_spent_rough === 'number' && job.client_spent_rough >= 5000;
-      if (!hasFatClient) {
+      const hasMatching = matched >= 2;  // сильный signal переопределяет age
+      if (!hasFatClient && !hasMatching) {
         return { action: 'skip', reason: 'too_old' };
       }
     }
