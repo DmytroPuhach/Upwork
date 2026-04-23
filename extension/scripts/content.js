@@ -170,20 +170,186 @@
   // JOB CARD SELECTORS
   // ═══════════════════════════════════════════════════════════
 
+  // ═══════════════════════════════════════════════════════════
+  // v17.1.5 — EXTENDED CARD EXTRACTION
+  // На search card Upwork показывает не только title/country/budget,
+  // но и client rating, spent-to-date, payment verified, posted-time.
+  // Достаём всё доступное — это сырьё для client-side prematch.
+  // ═══════════════════════════════════════════════════════════
+
+  function extractCardHints(el) {
+    const rawText = (el.textContent || '').replace(/\s+/g, ' ').trim();
+    const out = {
+      client_rating: null,
+      client_spent_rough: null,
+      payment_verified: null,
+      posted_ago_min: null,
+    };
+
+    // Rating — 3 стратегии
+    const ratingEl = el.querySelector('[class*="RatingStars"] .air3-rating-value, .air3-rating-value');
+    if (ratingEl) {
+      const n = parseFloat((ratingEl.textContent || '').trim());
+      if (!isNaN(n)) out.client_rating = n;
+    }
+    if (out.client_rating == null) {
+      const aria = el.querySelector('[aria-label*="Rating is"]')?.getAttribute('aria-label') || '';
+      const m = aria.match(/([\d.]+)\s*out of 5/i);
+      if (m) out.client_rating = parseFloat(m[1]);
+    }
+    if (out.client_rating == null) {
+      // Regex в raw text — на случай если <svg> визуализирует звёзды
+      const m = rawText.match(/(?:Rating\s+is\s+)?([\d.]+)\s*out\s+of\s+5/i);
+      if (m) { const n = parseFloat(m[1]); if (n >= 1 && n <= 5) out.client_rating = n; }
+    }
+
+    // Total spent: "$5K+ spent" / "$84,000 spent" / "$500 spent"
+    const spentM = rawText.match(/\$([\d,.]+)\s*([KkMm])?\+?\s*(?:total\s+)?spent/i);
+    if (spentM) {
+      const n = parseFloat(spentM[1].replace(/,/g, ''));
+      if (!isNaN(n)) {
+        const mult = spentM[2]?.toLowerCase() === 'k' ? 1000 : spentM[2]?.toLowerCase() === 'm' ? 1000000 : 1;
+        out.client_spent_rough = n * mult;
+      }
+    }
+
+    if (/Payment method verified|Payment\s+verified/i.test(rawText)) out.payment_verified = true;
+    else if (/Payment (method )?not verified|Payment unverified/i.test(rawText)) out.payment_verified = false;
+
+    // Posted: "Posted 15 minutes ago" / "Posted 2 hours ago" / "Posted yesterday"
+    const postedM = rawText.match(/Posted\s+(\d+)\s+(minute|hour|day|week)s?\s+ago/i);
+    if (postedM) {
+      const n = parseInt(postedM[1]);
+      const unit = postedM[2].toLowerCase();
+      out.posted_ago_min =
+        unit === 'minute' ? n :
+        unit === 'hour' ? n * 60 :
+        unit === 'day' ? n * 1440 : n * 10080;
+    } else if (/Posted\s+yesterday/i.test(rawText)) {
+      out.posted_ago_min = 1440;
+    } else if (/Posted\s+just now|Posted\s+a\s+(minute|few minutes)\s+ago/i.test(rawText)) {
+      out.posted_ago_min = 1;
+    }
+
+    return out;
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // v17.1.5 — CLIENT-SIDE PREMATCH
+  // Rule-based, no AI. Цель: не тратить enrichment слот (rate cap 5/hr)
+  // на jobs которые всё равно отвалятся на полном match. Решения:
+  //   { action: 'enqueue' }              — отправить в enrichment queue
+  //   { action: 'skip', reason: '...' }  — ingest_only + match_scores skip row
+  //
+  // Причины (все попадают в dashboard как "skip: <reason>"):
+  //   country, title_employment, title_agency, title_pure_content,
+  //   title_call_heavy, off_niche, budget_too_low, rating_too_low, too_old
+  // ═══════════════════════════════════════════════════════════
+
+  function prematchDecide(job, spec, blockedCountries) {
+    const title = (job.title || '').toLowerCase();
+    const desc = (job.description || '').toLowerCase();
+    const country = (job.client_country || '').toLowerCase().trim();
+
+    // 1. Country blocked — mirror background.js isBlockedCountry logic
+    if (country && Array.isArray(blockedCountries) && blockedCountries.length > 0) {
+      const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z]/g, '');
+      const cn = norm(country);
+      if (cn.length >= 2) {
+        for (const bc of blockedCountries) {
+          const bcn = norm(bc);
+          if (!bcn || bcn.length < 2) continue;
+          if (cn === bcn || (cn.length >= 3 && bcn.length >= 3 && (cn.includes(bcn) || bcn.includes(cn)))) {
+            return { action: 'skip', reason: 'country' };
+          }
+        }
+      }
+    }
+
+    // 2. Title stopwords — mirror leadgen-v2 earlyStop
+    if (/\bjunior\s+seo|\bentry[-\s]level|full[-\s]time\s+seo|seo\s+assistant|seo\s+administrator/.test(title)) {
+      return { action: 'skip', reason: 'title_employment' };
+    }
+    if (/white[-\s]label|freelancers?\s+to\s+join|contractor\s+pool|for\s+our\s+agency|join\s+our\s+agency/.test(title + ' ' + desc)) {
+      return { action: 'skip', reason: 'title_agency' };
+    }
+    if (/^(blog writer|article writer|content writer|copywriter)\b/.test(title) &&
+        !/\bseo\b|\baudit\b|\bkeyword\b|\brank\b/.test(title + ' ' + desc)) {
+      return { action: 'skip', reason: 'title_pure_content' };
+    }
+    if (/30[-\s]minute consultation|paid consultation|coaching session|strategy call only/.test(title + ' ' + desc)) {
+      return { action: 'skip', reason: 'title_call_heavy' };
+    }
+
+    // 3. Niche fit — specialization tokens intersect title+skills
+    if (Array.isArray(spec) && spec.length > 0) {
+      const STOP = new Set(['seo', 'the', 'for', 'and', 'optimization', 'management',
+        'integration', 'expert', 'specialist']);
+      const tokens = new Set();
+      for (const phrase of spec) {
+        for (const w of String(phrase).toLowerCase().split(/[\s\-\/,]+/).filter(Boolean)) {
+          if (w.length >= 3 && !STOP.has(w)) tokens.add(w);
+        }
+      }
+      const hay = title + ' ' + (Array.isArray(job.skills) ? job.skills.join(' ').toLowerCase() : '');
+      const broadSeo = /\bseo\b|\baudit\b|\brank\b|\bgoogle\b|\btraffic\b|\bkeyword\b/.test(hay);
+      let nicheHit = false;
+      for (const t of tokens) { if (hay.includes(t)) { nicheHit = true; break; } }
+      if (!nicheHit && !broadSeo) {
+        return { action: 'skip', reason: 'off_niche' };
+      }
+    }
+
+    // 4. Budget too low — fixed < $30 is trash tier. Hourly не фильтруем
+    //    (там rate обсуждается). Consistent с leadgen-v2 vague check.
+    if (job.budget_type === 'fixed' && typeof job.budget_max === 'number' &&
+        job.budget_max > 0 && job.budget_max < 30) {
+      return { action: 'skip', reason: 'budget_too_low' };
+    }
+
+    // 5. Rating too low — если явно < 4.0 (новые клиенты null — ок, пропускаем)
+    if (typeof job.client_rating === 'number' && job.client_rating > 0 && job.client_rating < 4.0) {
+      return { action: 'skip', reason: 'rating_too_low' };
+    }
+
+    // 6. Too old — job старше 60 мин, и нет жирного clien history → low priority
+    //    "Скор всё равно упадёт на time_decay, и клиент уже видел 20+ proposals".
+    //    Исключение: если client_spent_rough > $5K — жирный, ещё может сработать.
+    if (typeof job.posted_ago_min === 'number' && job.posted_ago_min > 60) {
+      const hasFatClient = typeof job.client_spent_rough === 'number' && job.client_spent_rough >= 5000;
+      if (!hasFatClient) {
+        return { action: 'skip', reason: 'too_old' };
+      }
+    }
+
+    return { action: 'enqueue' };
+  }
+
   const JOB_STRATEGIES = [
     {
       name: 'testid',
       find: () => document.querySelectorAll('[data-testid*="job-tile"], article[data-ev-sublocation-str*="job"]'),
       extract: (el) => {
         const titleA = el.querySelector('h2 a, h3 a, a[href*="/jobs/"]');
+        // v17.1.5: country fallback chain — 4 стратегии
+        let country = el.querySelector('[data-test*="country"], [data-testid*="location"], [data-test*="location"]')?.textContent?.trim()
+                   || el.querySelector('[aria-label*="Location"]')?.getAttribute('aria-label')?.replace(/^Location[:\s]+/i, '').trim()
+                   || null;
+        if (!country) {
+          // Regex fallback — countries обычно в конце карточки после client stats
+          const m = (el.textContent || '').match(/(United States|United Kingdom|USA|UK|Canada|Australia|Germany|France|Switzerland|Netherlands|Spain|Italy|Sweden|Norway|Denmark|Finland|Belgium|Austria|Ireland|New Zealand|Singapore|Japan|United Arab Emirates|UAE|Israel|India|Pakistan|Bangladesh|Philippines|Vietnam|Indonesia|Nigeria|Kenya|Egypt|Morocco|Turkey|Brazil|Mexico|Argentina)\b/);
+          if (m) country = m[1];
+        }
+        const hints = extractCardHints(el);
         return {
           title: titleA?.textContent?.trim(),
           url: titleA?.href,
           description: el.querySelector('[data-test*="description"], p')?.textContent?.trim()?.substring(0, 3000),
           budget: el.querySelector('[data-test*="budget"], [data-testid*="budget"]')?.textContent?.trim(),
-          country: el.querySelector('[data-test*="country"], [data-testid*="location"]')?.textContent?.trim(),
+          country,
           skills: Array.from(el.querySelectorAll('[data-test*="skill"], .air3-token')).map(s => s.textContent.trim()).filter(Boolean).slice(0, 20),
-          raw_text: el.textContent?.trim()?.substring(0, 5000)
+          raw_text: el.textContent?.trim()?.substring(0, 5000),
+          ...hints,
         };
       }
     },
@@ -192,14 +358,21 @@
       find: () => document.querySelectorAll('.job-tile, [class*="JobTile"], [class*="job-tile"]'),
       extract: (el) => {
         const titleA = el.querySelector('a[href*="/jobs/"]');
+        let country = el.querySelector('[class*="country"], [class*="Location"]')?.textContent?.trim() || null;
+        if (!country) {
+          const m = (el.textContent || '').match(/(United States|United Kingdom|USA|UK|Canada|Australia|Germany|France|Switzerland|Netherlands|India|Pakistan|Bangladesh|Philippines)\b/);
+          if (m) country = m[1];
+        }
+        const hints = extractCardHints(el);
         return {
           title: titleA?.textContent?.trim() || el.querySelector('h2, h3, h4')?.textContent?.trim(),
           url: titleA?.href,
           description: el.querySelector('[class*="description"], p')?.textContent?.trim()?.substring(0, 3000),
           budget: el.querySelector('[class*="budget"], [class*="Budget"]')?.textContent?.trim(),
-          country: el.querySelector('[class*="country"], [class*="Location"]')?.textContent?.trim(),
+          country,
           skills: Array.from(el.querySelectorAll('[class*="token"], [class*="Skill"]')).map(s => s.textContent.trim()).filter(Boolean).slice(0, 20),
-          raw_text: el.textContent?.trim()?.substring(0, 5000)
+          raw_text: el.textContent?.trim()?.substring(0, 5000),
+          ...hints,
         };
       }
     },
@@ -211,11 +384,13 @@
       },
       extract: (el) => {
         const a = el.querySelector('a[href*="/jobs/"]');
+        const hints = extractCardHints(el);
         return {
           title: a?.textContent?.trim(), url: a?.href,
           description: el.textContent?.trim().substring(0, 1000),
           budget: null, country: null, skills: [],
-          raw_text: el.textContent?.trim()?.substring(0, 5000)
+          raw_text: el.textContent?.trim()?.substring(0, 5000),
+          ...hints,
         };
       }
     }
@@ -319,6 +494,12 @@
 
       const seen = getSeenSet('jobs');
       const newJobs = [];
+      const skippedByPrematch = [];  // v17.1.5: для логирования в dashboard
+
+      // v17.1.5: достаём spec + blocked_countries один раз, переиспользуем в цикле
+      const { cachedIdentity: identity } = await chrome.storage.local.get('cachedIdentity');
+      const accountSpec = identity?.account?.specialization || identity?.member?.specialization || [];
+      const blockedCountries = identity?.account?.blocked_countries || identity?.member?.blocked_countries || [];
 
       for (const el of result.elements) {
         try {
@@ -333,7 +514,7 @@
 
           const budget = parseBudget(data.budget || data.raw_text || '');
 
-          newJobs.push({
+          const jobPayload = {
             upwork_id: upworkId || fingerprint,
             title: data.title.substring(0, 500),
             url: data.url,
@@ -343,23 +524,47 @@
             budget_min: budget.min,
             budget_max: budget.max,
             client_country: data.country,
+            // v17.1.5: new hints from search card — used by prematch & dashboard
+            client_rating: data.client_rating ?? null,
+            client_spent_rough: data.client_spent_rough ?? null,
+            payment_verified: data.payment_verified ?? null,
+            posted_ago_min: data.posted_ago_min ?? null,
             skills: data.skills || []
-          });
+          };
+
+          // v17.1.5: client-side prematch. Skip = не тратим enrichment слот.
+          const verdict = prematchDecide(jobPayload, accountSpec, blockedCountries);
+          if (verdict.action === 'skip') {
+            skippedByPrematch.push({ job: jobPayload, reason: verdict.reason });
+          } else {
+            newJobs.push(jobPayload);
+          }
         } catch (e) { warn('Job extract error:', e); }
       }
 
+      // v17.1.5: отправляем skipped jobs как ingest_only с prematch_reason.
+      // Эти сразу попадают в match_scores как 'skip' с detected_stop_reason,
+      // и видны в дашборде с понятной причиной вместо молчаливого 'pending'.
+      for (const s of skippedByPrematch) {
+        chrome.runtime.sendMessage({
+          type: 'JOB_SCRAPED_SKIP',
+          payload: { ...s.job, prematch_reason: s.reason, prematch_score: 0 }
+        }).catch(() => {});
+      }
+      if (skippedByPrematch.length > 0) {
+        log(`🚫 ${skippedByPrematch.length} jobs skipped by prematch:`,
+          skippedByPrematch.map(s => s.reason).join(', '));
+      }
+
       if (newJobs.length > 0) {
-        log(`💼 ${newJobs.length} new jobs via ${result.strategy}`);
+        log(`💼 ${newJobs.length} new jobs via ${result.strategy} (after prematch)`);
         reportSuccess('jobs_search', result.strategy, result.elements.length);
         for (const j of newJobs.slice(0, 10)) {
           chrome.runtime.sendMessage({ type: 'JOB_SCRAPED', payload: j }).catch(() => {});
         }
         // v17.1.0: hand off candidates to background.js for enrichment pre-rank.
-        // Background picks top-N by title+skills match against the account's
-        // specialization and opens them in background tabs with human delays.
-        // v17.1.3: include client_country so background can skip blocked
-        // countries from the enrichment queue (don't waste slots on jobs
-        // we'll reject at prematch anyway).
+        // v17.1.5: pass posted_ago_min + client_spent_rough so background can
+        // prioritize queue by freshness + fat clients instead of pure FIFO.
         chrome.runtime.sendMessage({
           type: 'JOBS_CANDIDATES',
           payload: {
@@ -369,6 +574,8 @@
               title: j.title,
               skills: j.skills,
               client_country: j.client_country,
+              posted_ago_min: j.posted_ago_min,
+              client_spent_rough: j.client_spent_rough,
             })),
             source_url: location.href.substring(0, 300),
           }
