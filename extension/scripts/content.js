@@ -1,5 +1,9 @@
 
-// OptimizeUp Extension v17.1.0 — Content Script
+// OptimizeUp Extension v17.1.3 — Content Script
+// v17.1.3: no functional change here — background.js now applies a search-page
+// prematch against blocked_countries (using client_country we already send)
+// and attaches prematch_reason to the ingest_only call. enrich.js now also
+// sends title so dashboard rows stop showing "unknown".
 // v17.1.0: emits JOBS_CANDIDATES so background.js can pre-rank + enqueue top-N
 // for background-tab enrichment (full description / client stats). The legacy
 // JOB_SCRAPED path stays for DB-ingest (funnel tracking), but scoring is now
@@ -353,6 +357,9 @@
         // v17.1.0: hand off candidates to background.js for enrichment pre-rank.
         // Background picks top-N by title+skills match against the account's
         // specialization and opens them in background tabs with human delays.
+        // v17.1.3: include client_country so background can skip blocked
+        // countries from the enrichment queue (don't waste slots on jobs
+        // we'll reject at prematch anyway).
         chrome.runtime.sendMessage({
           type: 'JOBS_CANDIDATES',
           payload: {
@@ -361,6 +368,7 @@
               url: j.url,
               title: j.title,
               skills: j.skills,
+              client_country: j.client_country,
             })),
             source_url: location.href.substring(0, 300),
           }

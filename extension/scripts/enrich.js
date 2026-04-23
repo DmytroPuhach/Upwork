@@ -92,6 +92,35 @@
     return { text: '', strategy: 'none' };
   }
 
+  // v17.1.3: extract job title from single-job page. Previously title was lost
+  // during enrichment → rows got title="unknown" if ingest_only arrived after
+  // enrichment (race). Now we always send title in the enrichment payload.
+  function extractTitle() {
+    // Strategy 1: data-test attributes on the H1 or its wrapper
+    const s1 = qsText('h1[data-test="job-title"], h1[data-test="JobTitle"], [data-test="job-title"] h1, [data-test="JobTitle"] h1');
+    if (s1) return s1.substring(0, 500);
+
+    // Strategy 2: H1 inside the job header section
+    const s2 = qsText('section[data-test="JobDetails"] h1, header h1, main h1');
+    if (s2) return s2.substring(0, 500);
+
+    // Strategy 3: any first H1 with reasonable length
+    const h1 = document.querySelector('h1');
+    if (h1) {
+      const t = (h1.textContent || '').trim();
+      if (t.length >= 5 && t.length <= 500) return t;
+    }
+
+    // Strategy 4: document.title, strip Upwork suffix
+    const dt = (document.title || '')
+      .replace(/\s*[-\u2013|]\s*Upwork.*$/i, '')
+      .replace(/\s*\|\s*Upwork.*$/i, '')
+      .trim();
+    if (dt && dt.length >= 5 && !/^Upwork/i.test(dt)) return dt.substring(0, 500);
+
+    return null;
+  }
+
   function extractBudget() {
     // Try both hourly and fixed markers. Upwork single-job page shows budget in a
     // highlighted stats strip, usually with data-test or class markers.
@@ -354,11 +383,13 @@
     const skills = extractSkills();
     const screening = extractScreeningQuestions();
     const meta = extractMeta();
+    const title = extractTitle();
 
     const payload = {
       ok: true,
       upwork_job_id: extractUpworkJobId(),
       url: location.href,
+      title,
       description: descResult.text,
       description_strategy: descResult.strategy,
       budget_raw: budgetRaw,
@@ -370,6 +401,7 @@
     };
 
     log('extracted:', {
+      title: title?.substring(0, 40),
       desc_chars: payload.description.length,
       strategy: payload.description_strategy,
       country: clientStats.country,

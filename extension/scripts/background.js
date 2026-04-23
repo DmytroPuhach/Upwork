@@ -1,4 +1,7 @@
-// OptimizeUp Extension v17.1.0 — Background Service Worker
+// OptimizeUp Extension v17.1.3 — Background Service Worker
+// v17.1.3: debounce duplicate JOB_SCRAPED sends (was 3-5x parallel → 1 req/job),
+//   accept prematch_reason/prematch_score from content.js and pass to leadgen-v2
+//   (surfaces "skip: country" in dashboard instead of silent pending).
 // v17.1.0: Job enrichment worker — opens top candidates in background tabs,
 // extracts full description + client stats via injected enrich.js,
 // enforces human-like timing, hourly caps, and halts on login-redirect.
@@ -784,14 +787,65 @@ async function handleInboundMessage(payload) {
   } catch (e) { return { error: String(e) }; }
 }
 
+// v17.1.3: in-memory debounce map to collapse 3-5x parallel JOB_SCRAPED
+// events on the same upwork_id — fixes ~137/day upsert_job_error spam
+// in leadgen_debug. 10 min is enough (content.js seen-set already dedups
+// per page session; this covers cross-tab / fast re-observes).
+const recentIngests = new Map();  // upwork_id -> ts
+const INGEST_DEDUP_MS = 10 * 60 * 1000;
+function shouldSkipDuplicateIngest(upworkId) {
+  if (!upworkId) return false;
+  const now = Date.now();
+  if (recentIngests.size > 500) {
+    for (const [k, ts] of recentIngests.entries()) {
+      if (now - ts > INGEST_DEDUP_MS) recentIngests.delete(k);
+    }
+  }
+  const prev = recentIngests.get(upworkId);
+  if (prev && now - prev < INGEST_DEDUP_MS) return true;
+  recentIngests.set(upworkId, now);
+  return false;
+}
+
+// v17.1.3: normalize country strings for comparison against account.blocked_countries.
+// Handles "United Arab Emirates" / "ARE" / "U.A.E" style variants; fallback is
+// case-insensitive substring match (also handles "blocked=India" vs job="India").
+function isBlockedCountry(jobCountry, blockedList) {
+  if (!jobCountry || !Array.isArray(blockedList) || blockedList.length === 0) return false;
+  const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z]/g, '').trim();
+  const j = norm(jobCountry);
+  if (j.length < 2) return false;
+  for (const bc of blockedList) {
+    const b = norm(bc);
+    if (!b || b.length < 2) continue;
+    if (j === b) return true;
+    if (j.length >= 3 && b.length >= 3 && (j.includes(b) || b.includes(j))) return true;
+  }
+  return false;
+}
+
 async function handleScrapedJob(payload) {
-  // v17.1.0: ingest-only — leadgen-v2 upserts the row but does NOT score yet.
-  // Scoring is triggered by extension-job-enrich after full description arrives.
+  // v17.1.3: pre-match skip on search page. If job's country is in
+  // account.blocked_countries — still call leadgen-v2 with ingest_only, but
+  // attach prematch_reason so the skip is recorded in match_scores and we
+  // don't waste an enrichment slot on a job we'd reject post-enrich anyway.
+  // Scoring for non-skipped jobs is triggered by extension-job-enrich after
+  // full description arrives.
   const { cachedIdentity, machineId, pausedUntilUpdate } = await chrome.storage.local.get([
     'cachedIdentity', 'machineId', 'pausedUntilUpdate'
   ]);
   if (pausedUntilUpdate) return { skipped: 'paused_for_update' };
   if (!cachedIdentity?.member?.is_bidding_enabled) return { skipped: 'bidding_disabled' };
+
+  // v17.1.3 debounce — collapse parallel JOB_SCRAPED for the same job
+  if (shouldSkipDuplicateIngest(payload?.upwork_id)) {
+    return { skipped: 'debounce', upwork_id: payload?.upwork_id };
+  }
+
+  const blocked = cachedIdentity.account?.blocked_countries
+               || cachedIdentity.member?.blocked_countries
+               || [];
+  const countryBlocked = isBlockedCountry(payload.client_country, blocked);
 
   const body = {
     account_slug: cachedIdentity.member.slug,
@@ -799,6 +853,10 @@ async function handleScrapedJob(payload) {
     job: payload,
     ingest_only: true,
   };
+  if (countryBlocked) {
+    body.prematch_reason = 'country';
+    body.prematch_score = 0;
+  }
 
   fetch(`${SB_URL}/functions/v1/leadgen-v2`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
@@ -809,7 +867,7 @@ async function handleScrapedJob(payload) {
   const count = (stored.countsDate === today) ? (stored.jobsScrapedToday || 0) + 1 : 1;
   await chrome.storage.local.set({ jobsScrapedToday: count, countsDate: today });
 
-  return { ok: true, queued: payload.upwork_id || payload.url };
+  return { ok: true, queued: payload.upwork_id || payload.url, prematch_skip: countryBlocked };
 }
 
 function prerank(jobs, specialization) {
@@ -859,8 +917,22 @@ async function handleJobsCandidates(payload) {
   const { cachedIdentity } = await chrome.storage.local.get('cachedIdentity');
   if (!cachedIdentity?.member?.is_bidding_enabled) return { skipped: 'bidding_disabled' };
 
+  // v17.1.3: strip blocked-country jobs BEFORE enrichment prerank.
+  // Search-page client_country is often reliable enough to catch obvious
+  // blocks (India, Pakistan). If blocked, skip enrichment entirely — the
+  // JOB_SCRAPED path will still ingest the row with prematch_reason='country'
+  // so the dashboard shows why we passed.
+  const blocked = cachedIdentity.account?.blocked_countries
+               || cachedIdentity.member?.blocked_countries
+               || [];
+  const filtered = jobs.filter(j => !isBlockedCountry(j.client_country, blocked));
+  const stripped = jobs.length - filtered.length;
+  if (stripped > 0) console.log(`[OU enrich] prematch filter: ${stripped} blocked-country jobs skipped`);
+
+  if (filtered.length === 0) return { ok: true, enqueued: 0, stripped_blocked: stripped };
+
   const spec = cachedIdentity.account?.specialization || cachedIdentity.member?.specialization || [];
-  const top = prerank(jobs, spec);
+  const top = prerank(filtered, spec);
 
   const addedIds = await enqueueForEnrichment(top.map(j => ({
     upwork_id: j.upwork_id,
@@ -871,7 +943,7 @@ async function handleJobsCandidates(payload) {
 
   maybeProcessEnrichQueue().catch(() => {});
 
-  return { ok: true, enqueued: addedIds.length, total_candidates: jobs.length };
+  return { ok: true, enqueued: addedIds.length, total_candidates: jobs.length, stripped_blocked: stripped };
 }
 
 // ═══════════════════════════════════════════════════════════
