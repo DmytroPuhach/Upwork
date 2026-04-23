@@ -947,6 +947,190 @@ async function handleJobsCandidates(payload) {
 }
 
 // ═══════════════════════════════════════════════════════════
+// v17.1.4 — PROFILE SYNC WORKER (2x/day, background tab)
+// ═══════════════════════════════════════════════════════════
+//
+// Once every ~12 hours (morning ~08:00 + evening ~19:00 Berlin, ±20min jitter),
+// open 3 Upwork SSR pages in a background tab, inject profile-sync.js, let it
+// parse Nuxt state and POST to profile-sync edge function.
+//
+// Mirrors enrich.js posture: human scroll, natural read-time, single tab at a
+// time, full credentialed context. NOT a fetch() — a real tab visit, so the
+// session/cookies/TLS fingerprint is identical to normal user browsing.
+
+const PROFILE_SYNC_PAGES = [
+  { slug: 'my-stats',         url: 'https://www.upwork.com/nx/my-stats/' },
+  { slug: 'proposals',        url: 'https://www.upwork.com/nx/proposals/' },
+  { slug: 'connects-history', url: 'https://www.upwork.com/nx/plans/connects/history/' },
+];
+const PROFILE_SYNC_PAGE_TIMEOUT_MS = 45000;    // per-tab ceiling
+const PROFILE_SYNC_READ_MS_MIN = 4000;         // dwell after load before inject
+const PROFILE_SYNC_READ_MS_MAX = 9000;
+const PROFILE_SYNC_JITTER_MS_MIN = 15000;      // between pages
+const PROFILE_SYNC_JITTER_MS_MAX = 30000;
+// Morning window: 07:40–08:20, evening: 18:40–19:20 Berlin.
+// We convert to the user's local tz at runtime using account.timezone
+// (defaults to Europe/Berlin per identify() payload).
+const PROFILE_SYNC_WINDOWS = [
+  { start_hour: 7,  start_min: 40, span_min: 40 },  // ~08:00 ± 20
+  { start_hour: 18, start_min: 40, span_min: 40 },  // ~19:00 ± 20
+];
+
+function randBetween(min, max) { return min + Math.floor(Math.random() * (max - min + 1)); }
+
+async function shouldRunProfileSyncNow() {
+  const { pausedUntilUpdate, scrapingActive, profileSyncLastRunAt, profileSyncNextSlotAt } =
+    await chrome.storage.local.get([
+      'pausedUntilUpdate', 'scrapingActive', 'profileSyncLastRunAt', 'profileSyncNextSlotAt'
+    ]);
+
+  if (pausedUntilUpdate) return { run: false, reason: 'paused_for_update' };
+
+  // Min gap 5h between runs so we don't double-fire on clock skew
+  if (profileSyncLastRunAt && (Date.now() - profileSyncLastRunAt) < 5 * 3600 * 1000) {
+    return { run: false, reason: 'too_soon_since_last' };
+  }
+
+  // If we've pre-scheduled a slot and we're not there yet — wait
+  if (profileSyncNextSlotAt && Date.now() < profileSyncNextSlotAt) {
+    return { run: false, reason: 'waiting_for_slot', next_at: profileSyncNextSlotAt };
+  }
+
+  // Berlin hour check. Cheap: just compare local hour in Berlin.
+  const nowBerlinH = Number(new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Europe/Berlin', hour: '2-digit', hour12: false
+  }).format(new Date()));
+  const nowBerlinM = Number(new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Europe/Berlin', minute: '2-digit'
+  }).format(new Date()));
+  const nowMinOfDay = nowBerlinH * 60 + nowBerlinM;
+
+  for (const w of PROFILE_SYNC_WINDOWS) {
+    const start = w.start_hour * 60 + w.start_min;
+    const end = start + w.span_min;
+    if (nowMinOfDay >= start && nowMinOfDay < end) {
+      return { run: true, window: w, minute_of_day: nowMinOfDay };
+    }
+  }
+
+  return { run: false, reason: 'outside_window', minute_of_day: nowMinOfDay };
+}
+
+async function runProfileSyncOnce(tabId, page, accountSlug) {
+  return await new Promise((resolve) => {
+    let settled = false;
+    const finish = (payload) => {
+      if (settled) return;
+      settled = true;
+      chrome.runtime.onMessage.removeListener(listener);
+      resolve(payload);
+    };
+
+    const listener = (msg, sender) => {
+      if (sender?.tab?.id !== tabId) return;
+      if (msg?.type !== 'PROFILE_SYNC_RESULT') return;
+      finish(msg.payload || { ok: false, error_type: 'empty_result' });
+    };
+    chrome.runtime.onMessage.addListener(listener);
+
+    // Timeout guard — if the page hangs, bail
+    const timer = setTimeout(() => finish({ ok: false, error_type: 'tab_timeout', page: page.slug }), PROFILE_SYNC_PAGE_TIMEOUT_MS);
+
+    (async () => {
+      try {
+        // Tag the document with our account slug so profile-sync.js can read it
+        await chrome.scripting.executeScript({
+          target: { tabId },
+          func: (slug) => { try { document.body.dataset.ouAccountSlug = slug; sessionStorage.setItem('ou_account_slug', slug); } catch {} },
+          args: [accountSlug],
+        });
+        // Natural read delay before parsing (mirrors enrich.js)
+        await new Promise(r => setTimeout(r, randBetween(PROFILE_SYNC_READ_MS_MIN, PROFILE_SYNC_READ_MS_MAX)));
+        // Inject the parser
+        await chrome.scripting.executeScript({
+          target: { tabId },
+          files: ['scripts/profile-sync.js'],
+        });
+      } catch (e) {
+        clearTimeout(timer);
+        finish({ ok: false, error_type: 'inject_failed', error_detail: String(e?.message || e), page: page.slug });
+      }
+    })();
+  });
+}
+
+async function runProfileSyncAllPages() {
+  const startedAt = Date.now();
+  const { cachedIdentity } = await chrome.storage.local.get('cachedIdentity');
+  const accountSlug = cachedIdentity?.member?.slug;
+  if (!accountSlug) {
+    console.log('[OU profile-sync] no account slug cached, skip');
+    return { ok: false, reason: 'no_account' };
+  }
+
+  // Block concurrent runs
+  const { profileSyncRunning } = await chrome.storage.local.get('profileSyncRunning');
+  if (profileSyncRunning) return { ok: false, reason: 'already_running' };
+  await chrome.storage.local.set({ profileSyncRunning: true });
+
+  const results = [];
+  try {
+    for (let i = 0; i < PROFILE_SYNC_PAGES.length; i++) {
+      const page = PROFILE_SYNC_PAGES[i];
+      console.log(`[OU profile-sync] → ${page.slug}`);
+
+      // Open background tab
+      let tab;
+      try {
+        tab = await chrome.tabs.create({ url: page.url, active: false });
+      } catch (e) {
+        results.push({ page: page.slug, ok: false, error: 'tab_create_failed' });
+        continue;
+      }
+
+      // Wait for complete load (or timeout handled inside runProfileSyncOnce)
+      await new Promise((resolve) => {
+        const onUpdated = (updatedId, info) => {
+          if (updatedId === tab.id && info.status === 'complete') {
+            chrome.tabs.onUpdated.removeListener(onUpdated);
+            resolve();
+          }
+        };
+        chrome.tabs.onUpdated.addListener(onUpdated);
+        setTimeout(() => { chrome.tabs.onUpdated.removeListener(onUpdated); resolve(); }, 15000);
+      });
+
+      const r = await runProfileSyncOnce(tab.id, page, accountSlug);
+      results.push({ page: page.slug, ...r });
+
+      try { await chrome.tabs.remove(tab.id); } catch {}
+
+      // Jitter between pages — except after the last
+      if (i < PROFILE_SYNC_PAGES.length - 1) {
+        await new Promise(r => setTimeout(r, randBetween(PROFILE_SYNC_JITTER_MS_MIN, PROFILE_SYNC_JITTER_MS_MAX)));
+      }
+    }
+  } finally {
+    await chrome.storage.local.set({
+      profileSyncRunning: false,
+      profileSyncLastRunAt: Date.now(),
+      profileSyncLastResults: results,
+      profileSyncLastDurationMs: Date.now() - startedAt,
+    });
+  }
+
+  console.log('[OU profile-sync] done', results.map(r => `${r.page}:${r.ok ? 'ok' : r.error_type || r.error || 'fail'}`).join(' | '));
+  return { ok: true, results };
+}
+
+async function maybeRunProfileSync() {
+  const check = await shouldRunProfileSyncNow();
+  if (!check.run) { /* silent — this fires every 10 min */ return; }
+  console.log('[OU profile-sync] window hit, starting', check.window);
+  await runProfileSyncAllPages();
+}
+
+// ═══════════════════════════════════════════════════════════
 // ALARMS
 // ═══════════════════════════════════════════════════════════
 
@@ -956,6 +1140,7 @@ chrome.runtime.onInstalled.addListener(async () => {
   chrome.alarms.create('heartbeat', { periodInMinutes: 2 });
   chrome.alarms.create('daily-reset', { periodInMinutes: 60 });
   chrome.alarms.create('enrich-drain', { periodInMinutes: 1 });
+  chrome.alarms.create('profile-sync-check', { periodInMinutes: 10 });  // v17.1.4
   await identify();
   await dailyReset();
   await heartbeat();
@@ -967,6 +1152,7 @@ chrome.runtime.onStartup.addListener(async () => {
   chrome.alarms.create('heartbeat', { periodInMinutes: 2 });
   chrome.alarms.create('daily-reset', { periodInMinutes: 60 });
   chrome.alarms.create('enrich-drain', { periodInMinutes: 1 });
+  chrome.alarms.create('profile-sync-check', { periodInMinutes: 10 });  // v17.1.4
   await identify();
   await dailyReset();
   await heartbeat();
@@ -976,6 +1162,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === 'heartbeat') await heartbeat();
   if (alarm.name === 'daily-reset') await dailyReset();
   if (alarm.name === 'enrich-drain') await maybeProcessEnrichQueue();
+  if (alarm.name === 'profile-sync-check') await maybeRunProfileSync();  // v17.1.4
 });
 
 (async () => {
