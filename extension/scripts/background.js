@@ -153,6 +153,7 @@ async function heartbeat() {
 
   await identify();
   await maybeReloadUpworkTab();
+  await maybeProcessFreshLane();
   await maybeProcessEnrichQueue();
 }
 
@@ -450,6 +451,56 @@ async function bumpLogCircuit() {
 }
 
 let _enrichInFlight = false;
+let _freshInFlight = false;  // v17.2.0: separate slot for fresh jobs (<15min)
+
+// v17.2.0: FRESH FAST LANE.
+// Если в очереди есть fresh job (<15 min) — обрабатываем его немедленно в
+// параллельном slot, минуя 25s gap и pickDelayMs. Rate cap 8/hr применяется
+// к обоим slot'ам вместе (общий счётчик). Индусы подают в первые 30s — мы
+// тоже должны быть на feed'е как только job появился.
+async function maybeProcessFreshLane() {
+  if (_freshInFlight) return;
+
+  const haltedUntil = await getHaltedUntil();
+  if (Date.now() < haltedUntil) return;
+
+  const { cachedIdentity, pausedUntilUpdate } = await chrome.storage.local.get([
+    'cachedIdentity', 'pausedUntilUpdate'
+  ]);
+  if (pausedUntilUpdate) return;
+  if (!cachedIdentity?.member?.is_bidding_enabled) return;
+  if (cachedIdentity?.scrape_settings?.pattern_mode === 'paused') return;
+  if (isInQuietHours(cachedIdentity)) return;
+
+  const hourly = await getHourlyCount();
+  if (hourly >= ENRICH_MAX_PER_HOUR) return;
+
+  const q = await getQueue();
+  if (q.length === 0) return;
+
+  // Find first fresh (<15 min) job in queue
+  const freshIdx = q.findIndex(item =>
+    typeof item.posted_ago_min === 'number' && item.posted_ago_min <= 15
+  );
+  if (freshIdx < 0) return;  // no fresh — regular lane handles
+
+  const head = q[freshIdx];
+  const rest = q.slice(0, freshIdx).concat(q.slice(freshIdx + 1));
+  await setQueue(rest);
+
+  _freshInFlight = true;
+  try {
+    console.log(`[OU fresh] ⚡ instant process: ${head.title?.substring(0, 50)} (age=${head.posted_ago_min}m)`);
+    await processOneJob(head, { fresh: true });
+  } catch (e) {
+    console.warn('[OU fresh] processOneJob threw', e);
+  } finally {
+    _freshInFlight = false;
+  }
+
+  // Immediately check for another fresh — no pickDelayMs wait
+  setTimeout(() => { maybeProcessFreshLane().catch(() => {}); }, 3000);
+}
 
 async function maybeProcessEnrichQueue() {
   if (_enrichInFlight) return;
@@ -495,8 +546,12 @@ async function maybeProcessEnrichQueue() {
   const q = await getQueue();
   if (q.length === 0) return;
 
-  const head = q[0];
-  const rest = q.slice(1);
+  // v17.2.0: fresh jobs (<15 min) skipped here — fresh lane handles them in parallel
+  const head = q.find(item =>
+    !(typeof item.posted_ago_min === 'number' && item.posted_ago_min <= 15)
+  );
+  if (!head) return;  // only fresh items left, let fresh lane drain
+  const rest = q.filter(x => x.upwork_id !== head.upwork_id);
   await setQueue(rest);
 
   _enrichInFlight = true;
@@ -514,9 +569,10 @@ async function maybeProcessEnrichQueue() {
   setTimeout(() => { maybeProcessEnrichQueue().catch(() => {}); }, nextDelay);
 }
 
-async function processOneJob(item) {
+async function processOneJob(item, opts = {}) {
+  const fresh = !!opts.fresh;
   const startedAt = Date.now();
-  console.log('[OU enrich] ▶ opening', item.upwork_id, item.title?.substring(0, 60));
+  console.log(`[OU ${fresh ? 'fresh' : 'enrich'}] ▶ opening`, item.upwork_id, item.title?.substring(0, 60));
 
   let tabId = null;
   let settled = false;
@@ -568,7 +624,10 @@ async function processOneJob(item) {
   });
 
   await loadedPromise;
-  await new Promise(r => setTimeout(r, ENRICH_MIN_READ_MS + Math.floor(Math.random() * ENRICH_READ_JITTER_MS)));
+  // v17.2.0: fresh jobs get 3-5s read (speed > stealth), regular 8-15s (human sim)
+  const readBase = fresh ? 3000 : ENRICH_MIN_READ_MS;
+  const readJitter = fresh ? 2000 : ENRICH_READ_JITTER_MS;
+  await new Promise(r => setTimeout(r, readBase + Math.floor(Math.random() * readJitter)));
 
   if (tabId) {
     try {
@@ -1045,6 +1104,7 @@ async function handleJobsCandidates(payload) {
     client_spent_rough: j.client_spent_rough ?? null,
   })));
 
+  maybeProcessFreshLane().catch(() => {});
   maybeProcessEnrichQueue().catch(() => {});
 
   return { ok: true, enqueued: addedIds.length, total_candidates: jobs.length, stripped_blocked: stripped };
@@ -1325,7 +1385,10 @@ chrome.runtime.onStartup.addListener(async () => {
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === 'heartbeat') await heartbeat();
   if (alarm.name === 'daily-reset') await dailyReset();
-  if (alarm.name === 'enrich-drain') await maybeProcessEnrichQueue();
+  if (alarm.name === 'enrich-drain') {
+    await maybeProcessFreshLane();
+    await maybeProcessEnrichQueue();
+  }
   if (alarm.name === 'profile-sync-check') await maybeRunProfileSync();  // v17.1.4
   if (alarm.name === 'search-rotate') await maybeRotateSearch();  // v17.1.6
 });
