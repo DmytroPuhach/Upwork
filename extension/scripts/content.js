@@ -342,13 +342,11 @@
       return { action: 'skip', reason: 'rating_too_low' };
     }
 
-    // 6. Too_old — режем только если >60 мин AND нет жирного клиента AND нет matching
-    if (typeof job.posted_ago_min === 'number' && job.posted_ago_min > 60) {
-      const hasFatClient = typeof job.client_spent_rough === 'number' && job.client_spent_rough >= 5000;
-      const hasMatching = matched >= 2;  // сильный signal переопределяет age
-      if (!hasFatClient && !hasMatching) {
-        return { action: 'skip', reason: 'too_old' };
-      }
+    // 6. Too_old — v17.2.0 FRESH FIRST: >30 min = skip, никаких исключений.
+    // Старые вакансии = 50+ proposals = Top Rated уже там. Смысла нет.
+    // Если >30 min висит — либо никто нормальный не идёт (мусор), либо толпа (мы не конкурент).
+    if (typeof job.posted_ago_min === 'number' && job.posted_ago_min > 30) {
+      return { action: 'skip', reason: 'too_old' };
     }
 
     return { action: 'enqueue' };
