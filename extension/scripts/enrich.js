@@ -234,16 +234,47 @@
   }
 
   function extractScreeningQuestions() {
-    const selectors = [
+    // Strategy 1: legacy data-test selectors (kept for backward compat if Upwork reverts)
+    const legacySelectors = [
       '[data-test="ScreeningQuestions"] li',
       '[data-test="screening-questions"] li',
       'section[aria-labelledby*="screening" i] li',
     ];
-    for (const sel of selectors) {
+    for (const sel of legacySelectors) {
       const items = qsAllText(sel);
-      if (items.length > 0) return items.slice(0, 10);
+      if (items.length > 0) {
+        return { questions: items.slice(0, 10), strategy: 'legacy:' + sel };
+      }
     }
-    return [];
+
+    // Strategy 2 (v17.1.8): text-anchor — find element containing the anchor phrase,
+    // walk up to nearest ancestor containing <li>, collect them.
+    // Anchor phrases observed on Upwork job detail pages:
+    //   "You will be asked to answer the following questions when submitting a proposal:"
+    //   "Answer the following questions when submitting a proposal"
+    //   "Screening questions"
+    const anchorRegex = /asked to answer the following questions|answer the following questions when submitting|screening questions/i;
+    const candidates = document.querySelectorAll('strong, b, h1, h2, h3, h4, h5, h6, label, p, span, div');
+    for (const el of candidates) {
+      const text = (el.textContent || '').trim();
+      if (text.length > 200) continue; // headers are short
+      if (!anchorRegex.test(text)) continue;
+      // Walk up up to 6 levels to find an ancestor holding <li> items
+      let parent = el.parentElement;
+      for (let depth = 0; depth < 6 && parent; depth++, parent = parent.parentElement) {
+        const lis = parent.querySelectorAll('li');
+        if (lis.length > 0 && lis.length <= 15) {
+          const items = Array.from(lis)
+            .map(li => (li.textContent || '').trim())
+            .filter(t => t.length >= 10 && t.length <= 500);
+          if (items.length > 0) {
+            return { questions: items.slice(0, 10), strategy: 'text-anchor:depth' + depth + ':' + el.tagName.toLowerCase() };
+          }
+        }
+      }
+    }
+
+    return { questions: [], strategy: 'none' };
   }
 
   function extractMeta() {
@@ -381,7 +412,7 @@
     const budgetRaw = extractBudget();
     const clientStats = extractClientStats();
     const skills = extractSkills();
-    const screening = extractScreeningQuestions();
+    const screeningResult = extractScreeningQuestions();
     const meta = extractMeta();
     const title = extractTitle();
 
@@ -394,7 +425,8 @@
       description_strategy: descResult.strategy,
       budget_raw: budgetRaw,
       skills,
-      screening_questions: screening,
+      screening_questions: screeningResult.questions,
+      screening_strategy: screeningResult.strategy,
       client: clientStats,
       meta,
       duration_ms: Date.now() - START_TS,
@@ -407,6 +439,8 @@
       country: clientStats.country,
       budget_raw: budgetRaw?.substring(0, 40),
       skills_n: skills.length,
+      screening_n: screeningResult.questions.length,
+      screening_strategy: screeningResult.strategy,
     });
 
     try {
