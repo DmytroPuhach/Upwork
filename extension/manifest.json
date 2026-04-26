@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "OptimizeUp Agency Assistant",
-  "version": "17.2.0",
-  "description": "Internal agency tool for OptimizeUp team — v17.2.0 Fresh Fast Lane: parallel slot for <15min jobs bypasses 25s gap + pickDelayMs, aggressive >30min skip (no fat-client exceptions), shorter 3-5s read for fresh. Speed > precision.",
+  "version": "17.3.0",
+  "description": "Internal agency tool for OptimizeUp team — v17.3.0 Chat Direction Fix: extension now correctly identifies who wrote each message (own vs client) using stable .user-name selector + Upwork story_HASH dedup. Stops the bulk-history dump that was polluting the DB. Fresh messages only (<30 min) carry direction='outbound'|'inbound' to reply-generator.",
   "permissions": ["storage", "alarms", "activeTab", "scripting", "tabs"],
   "host_permissions": [
     "https://www.upwork.com/*",

@@ -120,43 +120,137 @@
   }
 
   // ═══════════════════════════════════════════════════════════
-  // MESSAGE SELECTORS
+  // MESSAGE SELECTORS — v17.3.0 (correct DOM mapping)
+  //
+  // Real Upwork chat structure (verified Apr 2026):
+  //   .up-d-story-item[id^="story_HASH"]
+  //     ├── .story-day-header (optional, day separator only)
+  //     └── [data-test="story-container"]
+  //         ├── [data-test="story-header"]    ← present on FIRST msg of a batch from same author
+  //         │   ├── .user-name                ← AUTHOR (same selector for both sides!)
+  //         │   └── .story-timestamp[title]   ← full ISO timestamp in `title`
+  //         ├── .story-message
+  //         │   └── [data-test="story-message"]
+  //         │       └── <p> ... <span class="end-of-message"/></p>
+  //         └── .reply-wrapper (optional — quote of older msg, MUST be excluded from text)
+  //
+  // Continuation messages (short consecutive replies from same author) have NO
+  // story-message-header — author = previous story with header.
+  //
+  // Direction is determined by comparing AUTHOR NAME vs known account aliases.
+  // Stable id (`story_HASH`) is the dedup key — never reuses across reloads.
   // ═══════════════════════════════════════════════════════════
 
-  const MESSAGE_STRATEGIES = [
-    {
-      name: 'v1-proven',
-      find: () => document.querySelectorAll(
-        'p[class*="break-word"], [class*="message-body"] p, [data-test*="message"] p'
-      ),
-      extract: (el) => {
-        const text = el.textContent?.trim();
-        const container = el.closest('[class*="message"]') || el.closest('[class*="msg"]') || el.parentElement?.parentElement;
-        const isOwn = container?.querySelector?.('[class*="visitor"]')
-                   || container?.classList?.contains('is-own')
-                   || container?.querySelector?.('[class*="self"]');
-        return { text, is_own: !!isOwn, timestamp: container?.querySelector('time')?.getAttribute('datetime') };
-      }
-    },
-    {
-      name: 'testid-modern',
-      find: () => document.querySelectorAll('[data-testid*="message"] p, [data-test*="message"] [class*="body"]'),
-      extract: (el) => ({
-        text: el.textContent?.trim(),
-        is_own: null,
-        timestamp: el.closest('[data-testid*="message"]')?.querySelector('time')?.getAttribute('datetime')
-      })
-    },
-    {
-      name: 'air3',
-      find: () => document.querySelectorAll('.air3-msg-body, .air3-msg-item [class*="body"]'),
-      extract: (el) => ({
-        text: el.textContent?.trim(),
-        is_own: null,
-        timestamp: el.closest('.air3-msg-item')?.querySelector('time')?.getAttribute('datetime')
-      })
+  // Returns clean text from a story, EXCLUDING anything inside .reply-wrapper / .quote-attachment.
+  function extractStoryText(storyEl) {
+    const msgEl = storyEl.querySelector('[data-test="story-message"]');
+    if (!msgEl) return '';
+    // Walk only direct/relevant <p> not under reply-wrapper or quote
+    const paragraphs = msgEl.querySelectorAll('p');
+    const parts = [];
+    for (const p of paragraphs) {
+      if (p.closest('.reply-wrapper') || p.closest('.quote-attachment') || p.closest('.quote-wrap')) continue;
+      // Strip the <span class="end-of-message"></span> sentinel if present
+      const clone = p.cloneNode(true);
+      clone.querySelectorAll('.end-of-message').forEach(s => s.remove());
+      const t = (clone.textContent || '').trim();
+      if (t) parts.push(t);
     }
-  ];
+    return parts.join('\n').trim();
+  }
+
+  function extractStoryTimestamp(storyEl) {
+    // Prefer full ISO from title attribute on .story-timestamp ("April 20, 2026 at 2:07 PM")
+    const ts = storyEl.querySelector('[data-test="story-header"] .story-timestamp');
+    const title = ts?.getAttribute('title');
+    if (title) {
+      // Parse "April 20, 2026 at 2:07 PM" -> ISO
+      const cleaned = title.replace(' at ', ' ');
+      const d = new Date(cleaned);
+      if (!isNaN(d.getTime())) return d.toISOString();
+    }
+    // Fallback: short "9:22 PM" — won't have date, return null (server fills now())
+    return null;
+  }
+
+  function extractStoryAuthor(storyEl) {
+    return storyEl.querySelector('[data-test="story-header"] .user-name')?.textContent?.trim() || null;
+  }
+
+  function isStoryDeleted(storyEl) {
+    return !!storyEl.querySelector('.story-message.deleted');
+  }
+
+  // MAIN extractor — replaces the strategies-based approach with a stable structural walk.
+  function extractAllStories() {
+    const stories = document.querySelectorAll('[id^="story_"]');
+    const out = [];
+    let lastAuthor = null;
+    let lastTimestamp = null;
+
+    for (const storyEl of stories) {
+      try {
+        if (isStoryDeleted(storyEl)) continue;
+
+        const text = extractStoryText(storyEl);
+        if (!text || text.length < 2 || text.length > 8000) continue;
+
+        // Author: from header if present, else inherit from previous story (continuation)
+        const headerAuthor = extractStoryAuthor(storyEl);
+        const author = headerAuthor || lastAuthor;
+        if (headerAuthor) lastAuthor = headerAuthor;
+
+        // Timestamp: same logic — inherit if missing
+        const headerTs = extractStoryTimestamp(storyEl);
+        const timestamp = headerTs || lastTimestamp || new Date().toISOString();
+        if (headerTs) lastTimestamp = headerTs;
+
+        // Stable story id (Upwork's own hash) — best dedup key we can have
+        const storyId = storyEl.id || null;
+
+        out.push({
+          story_id: storyId,
+          author,
+          text,
+          timestamp,
+        });
+      } catch (e) {
+        warn('story extract fail:', e?.message);
+      }
+    }
+    return out;
+  }
+
+  // Direction detection: compare extracted author name with known account aliases.
+  // The currently signed-in account is whoever's profile is open in this tab.
+  // We get that from cachedIdentity (filled by background.js identify()).
+  // Fallback: also try DOM avatar aria-label / sidebar profile name.
+  function getOwnNameAliases(cachedIdentity) {
+    const aliases = new Set();
+    if (cachedIdentity?.upwork_user_name) aliases.add(cachedIdentity.upwork_user_name.trim());
+    if (cachedIdentity?.full_name) aliases.add(cachedIdentity.full_name.trim());
+    if (cachedIdentity?.first_name) aliases.add(cachedIdentity.first_name.trim());
+    if (Array.isArray(cachedIdentity?.aliases)) cachedIdentity.aliases.forEach(a => a && aliases.add(a.trim()));
+    // DOM fallback: top-right avatar / side nav
+    const avatarLabel = document.querySelector('header [aria-label*="avatar" i], [class*="user-menu"] [class*="name"]')?.getAttribute?.('aria-label')
+      || document.querySelector('[class*="user-menu"] [class*="name"]')?.textContent?.trim();
+    if (avatarLabel) aliases.add(avatarLabel.trim());
+    return aliases;
+  }
+
+  function classifyDirection(authorName, ownAliases) {
+    if (!authorName) return 'unknown';
+    const name = authorName.trim();
+    for (const own of ownAliases) {
+      if (!own) continue;
+      // Exact match OR first-name match (Dmytro / Dima / David / Davyd)
+      if (name === own) return 'outbound';
+      const ownFirst = own.split(/\s+/)[0].toLowerCase();
+      const authorFirst = name.split(/\s+/)[0].toLowerCase();
+      if (ownFirst.length >= 3 && ownFirst === authorFirst) return 'outbound';
+    }
+    return 'inbound';
+  }
 
   function getClientName() {
     return document.querySelector('[class*="room-header"] [class*="name"]')?.textContent?.trim()
@@ -448,49 +542,72 @@
     const roomId = extractRoomId();
     const clientName = getClientName();
 
-    const result = tryStrategies(MESSAGE_STRATEGIES, 1);
-    if (!result) {
+    const stories = extractAllStories();
+    if (!stories.length) {
       const sample = document.querySelector('main')?.outerHTML || document.body?.outerHTML?.substring(0, 10000);
       reportBroken('messages', sample);
       return;
     }
 
+    // Need own identity to classify direction
+    const { cachedIdentity } = await chrome.storage.local.get('cachedIdentity');
+    const ownAliases = getOwnNameAliases(cachedIdentity);
+
     const seen = getSeenSet('messages');
-    const newOnes = [];
+    const newMessages = [];
 
-    for (const el of result.elements) {
+    for (const story of stories) {
       try {
-        const data = result.extract(el);
-        if (!data.text || data.text.length < 3 || data.text.length > 5000) continue;
-        if (data.text === 'More options' || data.text === 'Show more' || data.text.startsWith('View ')) continue;
+        // Skip junk
+        if (story.text === 'More options' || story.text === 'Show more' || story.text.startsWith('View ')) continue;
 
-        const fingerprint = hash((roomId || clientName || 'x') + '|' + data.text.substring(0, 150));
-        if (seen.has(fingerprint)) continue;
+        // Stable Upwork-provided story id is the BEST dedup key.
+        // Fallback: hash by room+text if id missing for any reason.
+        const dedupKey = story.story_id
+          ? `sid:${story.story_id}`
+          : `txt:${hash((roomId || clientName || 'x') + '|' + story.text.substring(0, 150))}`;
+        if (seen.has(dedupKey)) continue;
+        addSeen('messages', dedupKey);
 
-        if (data.timestamp) {
-          const age = Date.now() - new Date(data.timestamp).getTime();
-          if (age > 30 * 60 * 1000) { addSeen('messages', fingerprint); continue; }
+        // Skip messages older than 30 min — historical bulk dump on first chat open
+        // is what poisoned the DB before. We only forward FRESH ones.
+        if (story.timestamp) {
+          const age = Date.now() - new Date(story.timestamp).getTime();
+          if (age > 30 * 60 * 1000) continue;
         }
 
-        if (data.is_own) { addSeen('messages', fingerprint); continue; }
+        const direction = classifyDirection(story.author, ownAliases);
 
-        addSeen('messages', fingerprint);
-        newOnes.push({ text: data.text, timestamp: data.timestamp, roomId });
-      } catch (e) { warn('Msg extract error:', e); }
+        newMessages.push({
+          story_id: story.story_id,
+          author: story.author,
+          direction,             // 'outbound' | 'inbound' | 'unknown'
+          text: story.text,
+          timestamp: story.timestamp,
+          roomId,
+        });
+      } catch (e) {
+        warn('Msg extract error:', e?.message);
+      }
     }
 
-    if (newOnes.length > 0) {
-      log(`📨 ${newOnes.length} new messages via ${result.strategy}`);
-      reportSuccess('messages', result.strategy, result.elements.length);
+    if (newMessages.length > 0) {
+      log(`📨 ${newMessages.length} new stories — sending with direction`);
+      reportSuccess('messages', 'story-walk-v17.3', stories.length);
 
-      for (const m of newOnes) {
+      for (const m of newMessages) {
         chrome.runtime.sendMessage({
           type: 'INBOUND_MESSAGE',
           payload: {
             client_name: clientName,
             client_message: m.text,
             chat_url: location.href,
-            message_timestamp: m.timestamp || new Date().toISOString()
+            message_timestamp: m.timestamp,
+            // v17.3.0 — explicit direction + author + stable story id
+            direction: m.direction,
+            author_name: m.author,
+            story_id: m.story_id,
+            account_aliases_count: ownAliases.size,
           }
         }).catch(() => {});
       }
