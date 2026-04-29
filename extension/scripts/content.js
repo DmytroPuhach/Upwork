@@ -227,14 +227,29 @@
   // Fallback: also try DOM avatar aria-label / sidebar profile name.
   function getOwnNameAliases(cachedIdentity) {
     const aliases = new Set();
+    // Root-level fields (legacy path — some edge fn versions flatten these)
     if (cachedIdentity?.upwork_user_name) aliases.add(cachedIdentity.upwork_user_name.trim());
     if (cachedIdentity?.full_name) aliases.add(cachedIdentity.full_name.trim());
     if (cachedIdentity?.first_name) aliases.add(cachedIdentity.first_name.trim());
     if (Array.isArray(cachedIdentity?.aliases)) cachedIdentity.aliases.forEach(a => a && aliases.add(a.trim()));
-    // DOM fallback: top-right avatar / side nav
-    const avatarLabel = document.querySelector('header [aria-label*="avatar" i], [class*="user-menu"] [class*="name"]')?.getAttribute?.('aria-label')
-      || document.querySelector('[class*="user-menu"] [class*="name"]')?.textContent?.trim();
-    if (avatarLabel) aliases.add(avatarLabel.trim());
+    // v17.5.1 fix: cachedIdentity is actually { member: {...}, account: {...} }
+    // The root-level fields above are always undefined — read from member/account instead.
+    const m = cachedIdentity?.member;
+    if (m?.slug) aliases.add(m.slug.trim());               // "david" / "davyd"
+    if (m?.name) aliases.add(m.name.trim());               // display name if present
+    if (m?.full_name) aliases.add(m.full_name.trim());
+    if (m?.first_name) aliases.add(m.first_name.trim());
+    if (m?.upwork_user_name) aliases.add(m.upwork_user_name.trim());
+    if (Array.isArray(m?.aliases)) m.aliases.forEach(a => a && aliases.add(a.trim()));
+    const acc = cachedIdentity?.account;
+    if (acc?.name) aliases.add(acc.name.trim());           // "Давид" — works for Cyrillic too
+    if (acc?.slug) aliases.add(acc.slug.trim());
+    // DOM fallback: top-right avatar / side nav (messages page uses different selectors)
+    const domName =
+      document.querySelector('[data-test="profile-name"]')?.textContent?.trim()
+      || document.querySelector('[class*="user-menu"] [class*="name"]')?.textContent?.trim()
+      || document.querySelector('header [aria-label*="avatar" i]')?.getAttribute('aria-label');
+    if (domName) aliases.add(domName.trim());
     return aliases;
   }
 
@@ -604,6 +619,11 @@
       reportSuccess('messages', 'story-walk-v17.3', stories.length);
 
       for (const m of newMessages) {
+        // v17.5.1: never send own messages to reply-generator — they are not client messages
+        if (m.direction === 'outbound') {
+          log('skip own msg (outbound):', m.author?.substring(0, 30));
+          continue;
+        }
         chrome.runtime.sendMessage({
           type: 'INBOUND_MESSAGE',
           payload: {

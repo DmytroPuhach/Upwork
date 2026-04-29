@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "OptimizeUp Agency Assistant",
-  "version": "17.5.1",
-  "description": "Internal agency tool for OptimizeUp team - v17.5.1 Better client name extraction from reviews.",
+  "version": "17.5.2",
+  "description": "Internal agency tool for OptimizeUp team - v17.5.2 Fix message direction: read member.slug from cachedIdentity, skip outbound before sending.",
   "permissions": ["storage", "alarms", "activeTab", "scripting", "tabs"],
   "host_permissions": [
     "https://www.upwork.com/*",
