@@ -1,4 +1,4 @@
-﻿// OptimizeUp Extension v17.1.3 — Background Service Worker
+﻿﻿// OptimizeUp Extension v17.1.3 — Background Service Worker
 // v17.1.3: debounce duplicate JOB_SCRAPED sends (was 3-5x parallel → 1 req/job),
 //   accept prematch_reason/prematch_score from content.js and pass to leadgen-v2
 //   (surfaces "skip: country" in dashboard instead of silent pending).
@@ -176,7 +176,7 @@ async function maybeReloadUpworkTab() {
     // v17.1.2: client-side quiet hours in account's own TZ
     if (isInQuietHours(cachedIdentity)) { console.log('[OU] reload skip: quiet hours (account TZ)'); return; }
 
-    const minSec = Math.max(settings.min_interval_sec || 180, 120);
+    const minSec = getSmartIntervalSec();
     const maxSec = Math.max(settings.max_interval_sec || 2700, minSec + 60);
 
     const sinceLastReload = lastReloadAt ? (Date.now() - lastReloadAt) / 1000 : Infinity;
@@ -258,6 +258,18 @@ function isInQuietHours(cachedIdentity) {
 }
 
 // ═══════════════════════════════════════════════════════════
+// v17.5.0: smart refresh interval based on Berlin peak hours.
+// Peak 09-23: refresh every 60s (EU morning + US business day).
+// Off-peak 23-09: refresh every 270s (almost no new postings).
+function getSmartIntervalSec() {
+  try {
+    const h = parseInt(new Intl.DateTimeFormat('en-US', {
+      timeZone: 'Europe/Berlin', hour12: false, hour: '2-digit'
+    }).format(new Date()), 10);
+    if (isNaN(h)) return 120;
+    return (h >= 9 && h < 23) ? 60 : 270;
+  } catch { return 120; }
+}
 
 function pickDelayMs() {
   const r = Math.random();
@@ -574,7 +586,7 @@ async function processOneJob(item, opts = {}) {
 
   // Skip jobs that have gone stale while sitting in the queue
   const actualAge = (item.posted_ago_min ?? 0) + (Date.now() - (item.queued_at ?? Date.now())) / 60000;
-  if (actualAge > 90) {
+  if (actualAge > 25) {
     console.log('[OU enrich] skip stale:', item.upwork_id, 'actualAge=', Math.round(actualAge) + 'm');
     return;
   }
