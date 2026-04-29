@@ -207,8 +207,18 @@
     if (nameEl?.textContent?.trim()) {
       stats.name = nameEl.textContent.trim();
     } else {
-      const m = allText.match(/(?:working with|worked with|work with|pleasure working with)\s+([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})?)\b/);
-      if (m) stats.name = m[1];
+      const NOISE = new Set(['Upwork', 'English', 'The', 'This', 'Great', 'Very', 'Good', 'It', 'He', 'She', 'We', 'My', 'Our', 'Their', 'His', 'Her']);
+      const nameRe = [
+        /(?:working with|worked with|work with|pleasure working with|collaborating with|hired by|hired through|from)\s+([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})?)\b/,
+        /([A-Z][a-z]{2,})\s+(?:is|was|has|had)\s+(?:a\s+)?(?:great|wonderful|excellent|amazing|fantastic|professional|responsive|clear|pleasure)/,
+        /([A-Z][a-z]{2,})['']s\s+(?:project|requirements|vision|expectations|brief|feedback|team)\s+(?:was|were|is|are)/,
+        /[Cc]lient\s+(?:[A-Z][a-z]{2,}\s+)?([A-Z][a-z]{2,})\s+(?:is|was|provided|gave|communicated|always)/,
+      ];
+      for (const re of nameRe) {
+        const m = allText.match(re);
+        const candidate = m && (m[2] || m[1]);
+        if (candidate && !NOISE.has(candidate)) { stats.name = candidate; break; }
+      }
     }
 
     return stats;

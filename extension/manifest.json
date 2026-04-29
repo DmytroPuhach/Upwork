@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "OptimizeUp Agency Assistant",
-  "version": "17.5.0",
-  "description": "Internal agency tool for OptimizeUp team - v17.5.0 Smart refresh: peak 60s/off-peak 270s. Stale skip >25min.",
+  "version": "17.5.1",
+  "description": "Internal agency tool for OptimizeUp team - v17.5.1 Better client name extraction from reviews.",
   "permissions": ["storage", "alarms", "activeTab", "scripting", "tabs"],
   "host_permissions": [
     "https://www.upwork.com/*",
