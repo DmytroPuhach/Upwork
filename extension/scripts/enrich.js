@@ -1,4 +1,4 @@
-// OptimizeUp Extension v17.1.0 — Job Enrichment Injectable
+﻿// OptimizeUp Extension v17.1.0 — Job Enrichment Injectable
 // Runs once in a background tab that opened a single-job page.
 // Extracts full description + budget + client stats + screening Qs,
 // then self-terminates. NEVER exposes action-triggering code paths.
@@ -145,6 +145,7 @@
     const stats = {
       country: null,
       city: null,
+      name: null,
       rating: null,
       reviews: null,
       total_spent: null,
@@ -200,6 +201,15 @@
 
     const reviews = allText.match(/\(\s*(\d+)\s*reviews?\s*\)/i);
     if (reviews) stats.reviews = parseInt(reviews[1]) || null;
+
+    // Client name — try direct selectors first, then extract from review text
+    const nameEl = document.querySelector('[data-qa="client-name"], [data-test="client-name"], [data-testid*="client-name"]');
+    if (nameEl?.textContent?.trim()) {
+      stats.name = nameEl.textContent.trim();
+    } else {
+      const m = allText.match(/(?:working with|worked with|work with|pleasure working with)\s+([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})?)\b/);
+      if (m) stats.name = m[1];
+    }
 
     return stats;
   }
@@ -468,3 +478,4 @@
   });
 
 })();
+

@@ -1,4 +1,4 @@
-
+﻿
 // OptimizeUp Extension v17.1.3 — Content Script
 // v17.1.3: no functional change here — background.js now applies a search-page
 // prematch against blocked_countries (using client_country we already send)
@@ -358,7 +358,8 @@
   //
   // Причины (все попадают в dashboard как "skip: <reason>"):
   //   country, title_employment, title_agency, title_pure_content,
-  //   title_call_heavy, off_niche, budget_too_low, rating_too_low, too_old
+  //   title_call_heavy, native_required, training_role,
+  //   off_niche, budget_too_low, rating_too_low, too_old
   // ═══════════════════════════════════════════════════════════
 
   // v17.1.7 philosophy: SPEED > PRECISION. Первый подавшийся на job получает
@@ -403,12 +404,19 @@
     if (/white[-\s]label|freelancers?\s+to\s+join|contractor\s+pool|for\s+our\s+agency|join\s+our\s+agency/.test(title + ' ' + desc)) {
       return { action: 'skip', reason: 'title_agency' };
     }
-    if (/^(blog writer|article writer|content writer|copywriter)\b/.test(title) &&
-        !/\bseo\b|\baudit\b|\bkeyword\b|\brank\b/.test(title + ' ' + desc)) {
+    if (/\b(?:content|blog|article|seo\s+content)\s+writer\b|\bcopywriter\b/.test(title)) {
       return { action: 'skip', reason: 'title_pure_content' };
     }
     if (/30[-\s]minute consultation|paid consultation|coaching session|strategy call only/.test(title + ' ' + desc)) {
       return { action: 'skip', reason: 'title_call_heavy' };
+    }
+    // Native language required — we don't qualify
+    if (/\bnative\s+(?:english|spanish|french|german|arabic|italian|portuguese|dutch|polish|language)\b|\bnative[-\s]level\s+\w+/.test(title + ' ' + desc)) {
+      return { action: 'skip', reason: 'native_required' };
+    }
+    // Training/coaching role — implies calls, waste of time
+    if (/\btraining\b|\bcoaching\b|\bmentoring\b/.test(title)) {
+      return { action: 'skip', reason: 'training_role' };
     }
 
     // 3. Off_niche — режем ТОЛЬКО если skills извлечены AND matched=0 AND title без broadSeo
@@ -431,8 +439,8 @@
       }
     }
 
-    // 5. Rating_too_low — режем только явно низкий (<3.5). Null rating пропускаем.
-    if (typeof job.client_rating === 'number' && job.client_rating > 0 && job.client_rating < 3.5) {
+    // 5. Rating_too_low — режем только явно низкий (<3.0). Null rating пропускаем.
+    if (typeof job.client_rating === 'number' && job.client_rating > 0 && job.client_rating < 3.0) {
       return { action: 'skip', reason: 'rating_too_low' };
     }
 
@@ -791,3 +799,4 @@
 
   log('✅ Content script loaded v' + EXT_VERSION);
 })();
+

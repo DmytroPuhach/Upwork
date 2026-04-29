@@ -1,4 +1,4 @@
-// OptimizeUp Extension v17.1.3 — Background Service Worker
+﻿// OptimizeUp Extension v17.1.3 — Background Service Worker
 // v17.1.3: debounce duplicate JOB_SCRAPED sends (was 3-5x parallel → 1 req/job),
 //   accept prematch_reason/prematch_score from content.js and pass to leadgen-v2
 //   (surfaces "skip: country" in dashboard instead of silent pending).
@@ -571,6 +571,14 @@ async function maybeProcessEnrichQueue() {
 
 async function processOneJob(item, opts = {}) {
   const fresh = !!opts.fresh;
+
+  // Skip jobs that have gone stale while sitting in the queue
+  const actualAge = (item.posted_ago_min ?? 0) + (Date.now() - (item.queued_at ?? Date.now())) / 60000;
+  if (actualAge > 90) {
+    console.log('[OU enrich] skip stale:', item.upwork_id, 'actualAge=', Math.round(actualAge) + 'm');
+    return;
+  }
+
   const startedAt = Date.now();
   console.log(`[OU ${fresh ? 'fresh' : 'enrich'}] ▶ opening`, item.upwork_id, item.title?.substring(0, 60));
 
@@ -1049,7 +1057,7 @@ function prerank(jobs, specialization) {
   // but it's still a useful positive signal vs non-SEO noise).
   const kws = Array.from(tokens);
 
-  if (kws.length === 0) return jobs.slice(0, 5);
+  if (kws.length === 0) return jobs.slice(0, 10);
 
   const scored = jobs.map(j => {
     const title = (j.title || '').toLowerCase();
@@ -1068,7 +1076,7 @@ function prerank(jobs, specialization) {
   // Only take scored items; if everything scored 0, fall back to first 5 by recency
   const positive = scored.filter(x => x.score > 0);
   const pool = positive.length > 0 ? positive : scored;
-  return pool.slice(0, 5).map(x => x.job);
+  return pool.slice(0, 10).map(x => x.job);
 }
 
 async function handleJobsCandidates(payload) {
@@ -1400,3 +1408,4 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (needsIdentify) await identify();
   await heartbeat();
 })();
+
