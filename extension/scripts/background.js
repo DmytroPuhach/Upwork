@@ -7,6 +7,7 @@
 // enforces human-like timing, hourly caps, and halts on login-redirect.
 
 const SB_URL = 'https://nsmcaexdqbipusjuzfht.supabase.co';
+const SB_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5zbWNhZXhkcWJpcHVzanV6Zmh0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM3MzcxMzcsImV4cCI6MjA4OTMxMzEzN30.SNZmkdBscH23J29nTfwd3luKc5MYyPXnNkp2eNxFU1Y';
 const EXT_VERSION = chrome.runtime.getManifest().version;
 
 console.log('[OU] Background loaded — version', EXT_VERSION);
@@ -745,6 +746,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     handleInboundMessage(msg.payload).then(r => sendResponse(r)).catch(e => sendResponse({ error: String(e) }));
     return true;
   }
+  if (msg?.type === 'OUTBOUND_MESSAGE') {
+    handleOutboundMessage(msg.payload).then(r => sendResponse(r)).catch(e => sendResponse({ error: String(e) }));
+    return true;
+  }
   if (msg?.type === 'JOB_SCRAPED') {
     handleScrapedJob(msg.payload).then(r => sendResponse(r)).catch(e => sendResponse({ error: String(e) }));
     return true;
@@ -916,6 +921,54 @@ async function handleInboundMessage(payload) {
     await chrome.storage.local.set({ messagesCapturedToday: count, countsDate: today });
     return { ok: true, data };
   } catch (e) { return { error: String(e) }; }
+}
+
+// v17.5.3: save outbound (David's own) messages to messages_context without triggering reply-generator
+async function handleOutboundMessage(payload) {
+  const { cachedIdentity } = await chrome.storage.local.get(['cachedIdentity']);
+  if (!cachedIdentity?.member?.slug) return { skipped: 'no_identity' };
+
+  const slug = cachedIdentity.member.slug;
+  const sbH = {
+    'apikey': SB_ANON_KEY,
+    'Authorization': `Bearer ${SB_ANON_KEY}`,
+    'Accept-Profile': 'upwork',
+    'Content-Profile': 'upwork',
+    'Content-Type': 'application/json',
+  };
+
+  // Lookup account_id by slug
+  const accRes = await fetch(`${SB_URL}/rest/v1/accounts?select=id&slug=eq.${encodeURIComponent(slug)}&limit=1`, { headers: sbH });
+  const accData = await accRes.json();
+  const accountId = accData?.[0]?.id;
+  if (!accountId) return { skipped: 'no_account', slug };
+
+  // Lookup client_id by name (exact ilike)
+  const nameQ = encodeURIComponent(payload.client_name || '');
+  const clientRes = await fetch(`${SB_URL}/rest/v1/clients?select=id&name=ilike.${nameQ}&limit=1`, { headers: sbH });
+  const clientData = await clientRes.json();
+  const clientId = clientData?.[0]?.id;
+  if (!clientId) return { skipped: 'client_not_found', name: payload.client_name };
+
+  // Insert outbound message directly into messages_context
+  const insertRes = await fetch(`${SB_URL}/rest/v1/messages_context`, {
+    method: 'POST',
+    headers: { ...sbH, 'Prefer': 'return=minimal' },
+    body: JSON.stringify({
+      client_id: clientId,
+      account_id: accountId,
+      message_direction: 'outbound',
+      raw_text: payload.text,
+      summary: payload.text?.substring(0, 300) || '',
+      story_id: payload.story_id || null,
+    }),
+  });
+
+  if (!insertRes.ok) {
+    const err = await insertRes.text();
+    return { error: `insert failed: ${err}` };
+  }
+  return { ok: true, saved: 'outbound', client: payload.client_name };
 }
 
 // v17.1.3: in-memory debounce map to collapse 3-5x parallel JOB_SCRAPED

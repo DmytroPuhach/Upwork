@@ -619,9 +619,18 @@
       reportSuccess('messages', 'story-walk-v17.3', stories.length);
 
       for (const m of newMessages) {
-        // v17.5.1: never send own messages to reply-generator — they are not client messages
+        // v17.5.3: save outbound to messages_context (no reply-gen), skip nothing
         if (m.direction === 'outbound') {
-          log('skip own msg (outbound):', m.author?.substring(0, 30));
+          log('outbound msg — saving to context only:', m.author?.substring(0, 30));
+          chrome.runtime.sendMessage({
+            type: 'OUTBOUND_MESSAGE',
+            payload: {
+              client_name: clientName,
+              text: m.text,
+              story_id: m.story_id,
+              message_timestamp: m.timestamp,
+            }
+          }).catch(() => {});
           continue;
         }
         chrome.runtime.sendMessage({

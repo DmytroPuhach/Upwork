@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "OptimizeUp Agency Assistant",
-  "version": "17.5.2",
-  "description": "Internal agency tool for OptimizeUp team - v17.5.2 Fix message direction: read member.slug from cachedIdentity, skip outbound before sending.",
+  "version": "17.5.3",
+  "description": "Internal agency tool for OptimizeUp team - v17.5.3 Save outbound messages to messages_context via direct REST (anon key), no reply-gen trigger.",
   "permissions": ["storage", "alarms", "activeTab", "scripting", "tabs"],
   "host_permissions": [
     "https://www.upwork.com/*",
