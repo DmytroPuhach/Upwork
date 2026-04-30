@@ -923,15 +923,17 @@ async function handleInboundMessage(payload) {
   } catch (e) { return { error: String(e) }; }
 }
 
-// v17.5.3: save outbound (David's own) messages to messages_context without triggering reply-generator
+// v17.5.4: save outbound messages via service_role key (internal tool — SW context only, not accessible to web pages)
+const SB_SVC_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5zbWNhZXhkcWJpcHVzanV6Zmh0Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MzczNzEzNywiZXhwIjoyMDg5MzEzMTM3fQ.8cziy072fTbGRO9A26PdHi5XOqonPJifCNyA1EeBhTo';
+
 async function handleOutboundMessage(payload) {
   const { cachedIdentity } = await chrome.storage.local.get(['cachedIdentity']);
   if (!cachedIdentity?.member?.slug) return { skipped: 'no_identity' };
 
   const slug = cachedIdentity.member.slug;
   const sbH = {
-    'apikey': SB_ANON_KEY,
-    'Authorization': `Bearer ${SB_ANON_KEY}`,
+    'apikey': SB_SVC_KEY,
+    'Authorization': `Bearer ${SB_SVC_KEY}`,
     'Accept-Profile': 'upwork',
     'Content-Profile': 'upwork',
     'Content-Type': 'application/json',
@@ -943,7 +945,7 @@ async function handleOutboundMessage(payload) {
   const accountId = accData?.[0]?.id;
   if (!accountId) return { skipped: 'no_account', slug };
 
-  // Lookup client_id by name (exact ilike)
+  // Lookup client_id by name
   const nameQ = encodeURIComponent(payload.client_name || '');
   const clientRes = await fetch(`${SB_URL}/rest/v1/clients?select=id&name=ilike.${nameQ}&limit=1`, { headers: sbH });
   const clientData = await clientRes.json();

@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "OptimizeUp Agency Assistant",
-  "version": "17.5.3",
-  "description": "Internal agency tool for OptimizeUp team - v17.5.3 Save outbound messages to messages_context via direct REST (anon key), no reply-gen trigger.",
+  "version": "17.5.4",
+  "description": "Internal agency tool for OptimizeUp team - v17.5.4 Save outbound messages via service_role REST (SW-only), fix anon key RLS block.",
   "permissions": ["storage", "alarms", "activeTab", "scripting", "tabs"],
   "host_permissions": [
     "https://www.upwork.com/*",
