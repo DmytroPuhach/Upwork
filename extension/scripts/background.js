@@ -1,4 +1,4 @@
-﻿﻿// OptimizeUp Extension v17.1.3 — Background Service Worker
+﻿// OptimizeUp Extension v17.5.5 — Background Service Worker
 // v17.1.3: debounce duplicate JOB_SCRAPED sends (was 3-5x parallel → 1 req/job),
 //   accept prematch_reason/prematch_score from content.js and pass to leadgen-v2
 //   (surfaces "skip: country" in dashboard instead of silent pending).
@@ -664,9 +664,7 @@ async function processOneJob(item, opts = {}) {
   const payload = await resultPromise;
   if (timeoutHandle) clearTimeout(timeoutHandle);
 
-  if (tabId !== null) {
-    try { await chrome.tabs.remove(tabId); } catch {}
-  }
+  // Keep enrichment tab open — freelancer can review the job page
 
   await incHourlyCount();
   const duration_ms = Date.now() - startedAt;
