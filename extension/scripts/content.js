@@ -1,5 +1,6 @@
 ﻿
-// OptimizeUp Extension v18.0.0 — Content Script
+// OptimizeUp Extension v18.0.3 — Content Script
+// v18.0.3: broadSeo regex — removed \bgoogle\b (matched "Google Ads" = PPC), tightened to google (search|analytics|search console) + organic traffic/search
 // v18.0.0: Added notifications/my_stats page types; maybeTriggerProfileSync() fires
 //   PROFILE_SYNC_TRIGGER to background.js when user visits these pages.
 // v17.1.3: no functional change here — background.js now applies a search-page
@@ -409,7 +410,7 @@
 
     const matched = Number(job.matched_skills) || 0;
     const total = Number(job.total_skills) || 0;
-    const broadSeo = /\bseo\b|\baudit\b|\brank\b|\bgoogle\b|\btraffic\b|\bkeyword\b|\bserp\b|\bsearch engine\b|\blink\s+building\b|\bbacklink\b|\boutreach\b|\bcontent optimization\b|\bon[-\s]page\b|\boff[-\s]page\b|\bindex/.test(title + ' ' + desc);
+    const broadSeo = /\bseo\b|\baudit\b|\brank(?:ing)?\b|\bserp\b|\bsearch engine\b|\blink\s+building\b|\bbacklink\b|\boutreach\b|\bcontent optimization\b|\bon[-\s]page\b|\boff[-\s]page\b|\bindex(?:ation|ing)?\b|\bkeyword research\b|\borganic search\b|\borganic traffic\b|\bgoogle (?:search|analytics|search console)\b|\btraffic growth\b/.test(title + ' ' + desc);
 
     // 1. Country blocked — hard no-go
     if (country && Array.isArray(blockedCountries) && blockedCountries.length > 0) {
