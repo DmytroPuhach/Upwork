@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "OptimizeUp Agency Assistant",
-  "version": "17.6.0",
-  "description": "Internal agency tool for OptimizeUp team - v17.6.0 Smart tab management: close if no bid, keep if matched.",
+  "version": "17.6.1",
+  "description": "Internal agency tool for OptimizeUp team - v17.6.1 Fix desc_timeout: expanded selectors for Upwork DOM change.",
   "permissions": ["storage", "alarms", "activeTab", "scripting", "tabs"],
   "host_permissions": [
     "https://www.upwork.com/*",
