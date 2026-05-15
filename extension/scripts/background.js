@@ -704,14 +704,16 @@ async function processOneJob(item, opts = {}) {
         description_chars: payload.description.length,
         duration_ms,
       });
-      // v17.6.0: close tab if this account is not in the bidding list
+      // v18.0.2: close tab unless this account is EXPLICITLY in bidding_accounts.
+      // Old logic kept tab open on null/undefined (timeout, error) — wasted open tabs.
       const mySlug = cachedIdentity?.member?.slug;
       const biddingAccounts = data?.bidding_accounts;
-      if (Array.isArray(biddingAccounts) && mySlug && !biddingAccounts.includes(mySlug)) {
+      const shouldBid = Array.isArray(biddingAccounts) && mySlug && biddingAccounts.includes(mySlug);
+      if (!shouldBid) {
         try { await chrome.tabs.remove(tabId); } catch {}
-        console.log('[OU enrich] 🔒 tab closed —', mySlug, 'not bidding. Bidding:', biddingAccounts.join(', ') || 'none');
+        console.log('[OU enrich] 🔒 tab closed —', mySlug, 'not in bidding:', (biddingAccounts || []).join(', ') || 'none');
       } else {
-        console.log('[OU enrich] 📌 tab kept —', mySlug, 'in bidding or no decision yet');
+        console.log('[OU enrich] 📌 tab kept —', mySlug, 'should bid');
       }
       console.log('[OU enrich] ✓', item.upwork_id, 'desc=', payload.description.length, 'srv=', data?.ok, 'bidding=', (biddingAccounts || []).join(','));
     } catch (e) {
