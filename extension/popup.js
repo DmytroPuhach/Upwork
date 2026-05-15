@@ -1,5 +1,4 @@
-// OptimizeUp Extension — popup (v18.0.5)
-// v18.0.5: Bidding toggle button — enable/disable bidding for current account directly from popup
+// OptimizeUp Extension — popup (v17.1.1)
 // v17.1.1: Scraping Control panel — Start/Stop/Save preset, wired to background.js
 
 document.getElementById('extVersion').textContent = chrome.runtime.getManifest().version;
@@ -41,6 +40,7 @@ function writePresetToUI(preset) {
     preset.hourly === true ? 'hourly' : preset.hourly === false ? 'fixed' : 'any';
 }
 
+// Toggle bidding status display and button label
 function updateBiddingUI(enabled) {
   const statusEl = document.getElementById('biddingStatus');
   const btnEl = document.getElementById('biddingToggleBtn');
@@ -149,9 +149,7 @@ document.getElementById('biddingToggleBtn').addEventListener('click', async () =
   const oldText = btn.textContent;
   btn.textContent = '⏳';
   setMsg(msgEl, '');
-
   const res = await chrome.runtime.sendMessage({ type: 'TOGGLE_BIDDING' });
-
   btn.disabled = false;
   if (res?.ok) {
     updateBiddingUI(res.bidding_enabled);
