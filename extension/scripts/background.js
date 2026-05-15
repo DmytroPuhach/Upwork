@@ -1,4 +1,7 @@
-﻿// OptimizeUp Extension v17.6.0 — Background Service Worker
+﻿// OptimizeUp Extension v18.0.0 — Background Service Worker
+// v18.0.0: Added /ab/notifications/ to profile-sync (DOM scrape — viewed/hired events).
+//   PROFILE_SYNC_TRIGGER message: content.js injects profile-sync.js on-demand
+//   when user navigates to notifications/proposals/my-stats pages.
 // v17.1.3: debounce duplicate JOB_SCRAPED sends (was 3-5x parallel → 1 req/job),
 //   accept prematch_reason/prematch_score from content.js and pass to leadgen-v2
 //   (surfaces "skip: country" in dashboard instead of silent pending).
@@ -801,6 +804,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }));
     return true;
   }
+  // v18: content.js fires this when user navigates to notifications/proposals/my-stats pages.
+  // Inject profile-sync.js directly into the caller's tab for an on-demand sync.
+  if (msg?.type === 'PROFILE_SYNC_TRIGGER') {
+    const tabId = sender?.tab?.id;
+    handleProfileSyncTrigger(tabId)
+      .then(r => sendResponse(r))
+      .catch(e => sendResponse({ error: String(e) }));
+    return true;
+  }
   // ENRICH_RESULT is handled via per-tab listener inside processOneJob
 });
 
@@ -1205,6 +1217,7 @@ async function handleJobsCandidates(payload) {
 // session/cookies/TLS fingerprint is identical to normal user browsing.
 
 const PROFILE_SYNC_PAGES = [
+  { slug: 'notifications',    url: 'https://www.upwork.com/ab/notifications/' },   // v18: DOM scrape — viewed/hired
   { slug: 'my-stats',         url: 'https://www.upwork.com/nx/my-stats/' },
   { slug: 'proposals',        url: 'https://www.upwork.com/nx/proposals/' },
   { slug: 'connects-history', url: 'https://www.upwork.com/nx/plans/connects/history/' },
@@ -1260,6 +1273,49 @@ async function shouldRunProfileSyncNow() {
   }
 
   return { run: false, reason: 'outside_window', minute_of_day: nowMinOfDay };
+}
+
+// v18: on-demand inject — fires when user manually opens a profile-sync page.
+// Injects profile-sync.js into the user's foreground tab immediately,
+// without waiting for the scheduled 2×/day background-tab visit.
+async function handleProfileSyncTrigger(tabId) {
+  if (!tabId) return { ok: false, reason: 'no_tab' };
+
+  const { cachedIdentity, pausedUntilUpdate } = await chrome.storage.local.get([
+    'cachedIdentity', 'pausedUntilUpdate'
+  ]);
+  if (pausedUntilUpdate) return { ok: false, reason: 'paused_for_update' };
+  const accountSlug = cachedIdentity?.member?.slug;
+  if (!accountSlug) return { ok: false, reason: 'no_account_slug' };
+
+  // Avoid double-inject on the same tab (profile-sync.js sets this key)
+  try {
+    const [already] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => sessionStorage.getItem('ou_profile_sync_active'),
+    });
+    if (already?.result === '1') return { ok: false, reason: 'already_injected' };
+  } catch {}
+
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (slug) => {
+        try {
+          document.body.dataset.ouAccountSlug = slug;
+          sessionStorage.setItem('ou_account_slug', slug);
+        } catch {}
+      },
+      args: [accountSlug],
+    });
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['scripts/profile-sync.js'],
+    });
+    return { ok: true, injected: true, account_slug: accountSlug };
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e) };
+  }
 }
 
 async function runProfileSyncOnce(tabId, page, accountSlug) {
