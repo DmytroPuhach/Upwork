@@ -1,5 +1,6 @@
-// OptimizeUp Extension v17.1.4 — Profile Sync Injectable
+// OptimizeUp Extension v18.0.0 — Profile Sync Injectable
 // Runs in a background tab after it's fully loaded on one of:
+//   /ab/notifications/        (v18: DOM scrape — viewed/hired events)
 //   /nx/my-stats/
 //   /nx/proposals/
 //   /nx/plans/connects/history/
@@ -52,10 +53,117 @@
 
   function detectPage() {
     const p = location.pathname;
+    if (/\/ab\/notifications/i.test(p)) return 'notifications';
     if (/\/nx\/my-stats/i.test(p)) return 'my-stats';
     if (/\/nx\/proposals/i.test(p)) return 'proposals';
     if (/\/nx\/plans\/connects\/history/i.test(p)) return 'connects-history';
     return null;
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // NOTIFICATIONS DOM SCRAPER (/ab/notifications/)
+  // /ab/ is NOT Nuxt — uses React/Angular. We scrape DOM directly.
+  // ═══════════════════════════════════════════════════════════
+
+  function parseRelativeTime(text) {
+    if (!text) return null;
+    if (/just now|a moment ago/i.test(text)) return new Date().toISOString();
+    const m = text.match(/(\d+)\s*(second|minute|hour|day|week|month|year)s?\s*ago/i);
+    if (!m) return null;
+    const n = parseInt(m[1], 10);
+    const unit = m[2].toLowerCase();
+    const ms = unit === 'second' ? n * 1000
+      : unit === 'minute' ? n * 60000
+      : unit === 'hour'   ? n * 3600000
+      : unit === 'day'    ? n * 86400000
+      : unit === 'week'   ? n * 7 * 86400000
+      : unit === 'month'  ? n * 30 * 86400000
+      :                     n * 365 * 86400000;
+    return new Date(Date.now() - ms).toISOString();
+  }
+
+  function parseNotificationsFromDom() {
+    const results = [];
+    const seen = new Set();
+
+    // Multi-strategy: find elements containing a job link that match our patterns
+    const candidates = Array.from(document.querySelectorAll(
+      '[data-notification-id], .notification-item, [class*="notification-item"], ' +
+      '[class*="NotificationItem"], [class*="notification_item"], li[class], article'
+    )).filter(el => {
+      const t = (el.textContent || '').trim();
+      return t.length > 10 && t.length < 2000 && el.querySelector('a[href*="/jobs/"]');
+    });
+
+    for (const el of candidates.slice(0, 100)) {
+      try {
+        const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+
+        let type = null;
+        if (/viewed your proposal|proposal (?:has been )?viewed/i.test(text)) type = 'proposal_viewed';
+        else if (/you(?:'re| were| have been) hired|hired for|contract (?:has )?started/i.test(text)) type = 'hired';
+        else if (/invited you to|invitation to interview|invited to apply/i.test(text)) type = 'invited';
+        if (!type) continue;
+
+        // Dedup by job link — one notification per job link
+        const linkEl = el.querySelector('a[href*="/jobs/"]');
+        const jobUrl = linkEl?.href || '';
+        const jobIdMatch = jobUrl.match(/~([\w]{10,})/);
+        const jobId = jobIdMatch ? jobIdMatch[1] : null;
+        const dedupKey = (jobId || text.substring(0, 80)) + ':' + type;
+        if (seen.has(dedupKey)) continue;
+        seen.add(dedupKey);
+
+        // Timestamp — prefer datetime attr, then text-based relative parse
+        let timestamp = null;
+        const timeEl = el.querySelector('time, [class*="time"], [class*="date"], [class*="ago"]');
+        if (timeEl) {
+          const dt = timeEl.getAttribute('datetime') || timeEl.getAttribute('title');
+          if (dt) {
+            const d = new Date(dt);
+            if (!isNaN(d.getTime())) timestamp = d.toISOString();
+          }
+          if (!timestamp) timestamp = parseRelativeTime(timeEl.textContent?.trim() || '');
+        }
+        if (!timestamp) {
+          const timeM = text.match(/(\d+\s+(?:second|minute|hour|day|week|month|year)s?\s+ago)/i);
+          if (timeM) timestamp = parseRelativeTime(timeM[1]);
+        }
+
+        results.push({
+          type,
+          upwork_job_id: jobId ? '~' + jobId : null,
+          job_url: jobUrl || null,
+          timestamp: timestamp || new Date().toISOString(),
+        });
+      } catch {}
+    }
+
+    return results;
+  }
+
+  async function waitForNotificationsDom() {
+    const started = Date.now();
+    return new Promise((resolve) => {
+      const tick = () => {
+        const auth = detectAuthFailure();
+        if (auth) return resolve({ auth_failure: auth });
+
+        const items = document.querySelectorAll(
+          '[data-notification-id], .notification-item, [class*="notification-item"], ' +
+          '[class*="NotificationItem"], [class*="notification_item"]'
+        );
+        // Also accept any li/article that has a job link — fallback for unknown DOM shapes
+        const fallback = items.length === 0
+          ? Array.from(document.querySelectorAll('li, article')).filter(el => el.querySelector('a[href*="/jobs/"]'))
+          : [];
+
+        if (items.length > 0 || fallback.length > 0) return resolve({ dom_ready: true });
+        if (Date.now() - started > HARD_TIMEOUT_MS) return resolve({ timeout: true });
+        setTimeout(tick, POLL_INTERVAL_MS);
+      };
+      tick();
+    });
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -408,6 +516,41 @@
       await sleep(900 + Math.random() * 900);
     } catch {}
 
+    // ── Notifications: DOM-based path (not Nuxt) ──────────────
+    if (page === 'notifications') {
+      const domRes = await waitForNotificationsDom();
+      if (domRes.auth_failure) { report({ ok: false, page, error_type: domRes.auth_failure }); return; }
+      if (domRes.timeout) { report({ ok: false, page, error_type: 'dom_timeout' }); return; }
+
+      let notifications;
+      try { notifications = parseNotificationsFromDom(); } catch (e) {
+        report({ ok: false, page, error_type: 'parser_exception', error_detail: String(e?.message || e) }); return;
+      }
+
+      if (notifications.length === 0) {
+        report({ ok: false, page, error_type: 'no_notifications' }); return;
+      }
+
+      const accountSlug = (document.body?.dataset?.ouAccountSlug) ||
+                          sessionStorage.getItem('ou_account_slug') || null;
+      if (!accountSlug) { report({ ok: false, page, error_type: 'no_account_slug' }); return; }
+
+      try {
+        const r = await fetch(`${SYNC_ENDPOINT}/notifications`, {
+          method: 'POST',
+          credentials: 'omit',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ account_slug: accountSlug, notifications }),
+        });
+        const data = await r.json().catch(() => ({}));
+        report({ ok: !!data.ok, page, parsed: notifications.length, updated: data.updated ?? 0, status: r.status, error: data.error || null });
+      } catch (e) {
+        report({ ok: false, page, error_type: 'post_failed', error_detail: String(e?.message || e) });
+      }
+      return;
+    }
+
+    // ── Nuxt pages: my-stats, proposals, connects-history ────
     const res = await waitForNuxt(page);
     if (res.auth_failure) { report({ ok: false, page, error_type: res.auth_failure }); return; }
     if (res.timeout) { report({ ok: false, page, error_type: 'nuxt_timeout' }); return; }
