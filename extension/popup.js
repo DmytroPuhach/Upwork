@@ -1,4 +1,5 @@
-// OptimizeUp Extension — popup (v17.1.1)
+// OptimizeUp Extension — popup (v18.0.5)
+// v18.0.5: Bidding toggle button — enable/disable bidding for current account directly from popup
 // v17.1.1: Scraping Control panel — Start/Stop/Save preset, wired to background.js
 
 document.getElementById('extVersion').textContent = chrome.runtime.getManifest().version;
@@ -40,6 +41,22 @@ function writePresetToUI(preset) {
     preset.hourly === true ? 'hourly' : preset.hourly === false ? 'fixed' : 'any';
 }
 
+function updateBiddingUI(enabled) {
+  const statusEl = document.getElementById('biddingStatus');
+  const btnEl = document.getElementById('biddingToggleBtn');
+  if (enabled) {
+    statusEl.textContent = '✅ enabled';
+    statusEl.className = 'value status-ok';
+    btnEl.textContent = 'Pause';
+    btnEl.className = 'toggle-btn on';
+  } else {
+    statusEl.textContent = '⏸ disabled';
+    statusEl.className = 'value status-warn';
+    btnEl.textContent = 'Enable';
+    btnEl.className = 'toggle-btn off';
+  }
+}
+
 // Toggle Start/Stop visibility based on scraping state
 function updateScrapingUI(active) {
   const startBtn = document.getElementById('startBtn');
@@ -76,14 +93,7 @@ async function loadStatus() {
   if (storage.cachedIdentity?.ok && storage.cachedIdentity.member) {
     const m = storage.cachedIdentity.member;
     document.getElementById('memberSlug').textContent = m.slug;
-    const biddingEl = document.getElementById('biddingStatus');
-    if (m.is_bidding_enabled) {
-      biddingEl.textContent = '✅ enabled';
-      biddingEl.className = 'value status-ok';
-    } else {
-      biddingEl.textContent = '⏸ disabled';
-      biddingEl.className = 'value status-warn';
-    }
+    updateBiddingUI(m.is_bidding_enabled);
     // Load preset from cached identity
     writePresetToUI(storage.cachedIdentity.scrape_preset);
   } else {
@@ -131,6 +141,26 @@ async function loadStatus() {
 // ═══════════════════════════════════════════════════════════
 // EVENT HANDLERS
 // ═══════════════════════════════════════════════════════════
+
+document.getElementById('biddingToggleBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('biddingToggleBtn');
+  const msgEl = document.getElementById('biddingMsg');
+  btn.disabled = true;
+  const oldText = btn.textContent;
+  btn.textContent = '⏳';
+  setMsg(msgEl, '');
+
+  const res = await chrome.runtime.sendMessage({ type: 'TOGGLE_BIDDING' });
+
+  btn.disabled = false;
+  if (res?.ok) {
+    updateBiddingUI(res.bidding_enabled);
+    setMsg(msgEl, res.bidding_enabled ? 'Bidding enabled' : 'Bidding paused', 'ok');
+  } else {
+    btn.textContent = oldText;
+    setMsg(msgEl, res?.error || 'Failed', 'err');
+  }
+});
 
 document.getElementById('refreshBtn').addEventListener('click', async () => {
   const btn = document.getElementById('refreshBtn');
