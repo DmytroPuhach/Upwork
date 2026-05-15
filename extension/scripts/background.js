@@ -20,7 +20,8 @@ console.log('[OU] Background loaded — version', EXT_VERSION);
 // ═══════════════════════════════════════════════════════════
 
 const ENRICH_MAX_QUEUE = 50;                  // cap in-memory queue size
-const ENRICH_MAX_PER_HOUR = 8;                // v17.1.7: was 5, +60% throughput
+const ENRICH_MAX_PER_HOUR = 8;                // regular lane: human-like pace
+const FRESH_MAX_PER_HOUR = 25;               // v18.0.4: fresh lane has separate higher cap — speed > stealth for <15min jobs
 // v17.1.2: human read/click cadence. Distribution approximates a real freelancer:
 // most opens 30-75s apart, sometimes slower, and ~5% "long pause" (3-5 min)
 // simulating distraction / coffee break. Gives avg ~75s between opens.
@@ -489,7 +490,7 @@ async function maybeProcessFreshLane() {
   if (isInQuietHours(cachedIdentity)) return;
 
   const hourly = await getHourlyCount();
-  if (hourly >= ENRICH_MAX_PER_HOUR) return;
+  if (hourly >= FRESH_MAX_PER_HOUR) return;  // v18.0.4: separate cap — don't let regular lane starve fresh jobs
 
   const q = await getQueue();
   if (q.length === 0) return;
