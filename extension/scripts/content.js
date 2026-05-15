@@ -297,6 +297,7 @@
       client_spent_rough: null,
       payment_verified: null,
       posted_ago_min: null,
+      proposals_min: null,       // v18.0.1: lower bound of proposals count range shown on card
       // v17.1.6: matched_skills / total_skills из .air3-token
       matched_skills: 0,
       total_skills: 0,
@@ -350,6 +351,15 @@
 
     if (/Payment method verified|Payment\s+verified/i.test(rawText)) out.payment_verified = true;
     else if (/Payment (method )?not verified|Payment unverified/i.test(rawText)) out.payment_verified = false;
+
+    // v18.0.1: proposals count from search card — used by prematch to skip crowded jobs
+    // Upwork shows: "Less than 5", "5 to 10", "10 to 15", "15 to 20", "20 to 50", "50+"
+    out.proposals_min = null;
+    const propM = rawText.match(/Proposals?:\s*(?:Less than\s*(\d+)|(\d+)\s*(?:to\s*\d+|\+))/i);
+    if (propM) {
+      // "Less than 5" → min=0; "5 to 10" or "50+" → min=first number
+      out.proposals_min = propM[1] ? 0 : parseInt(propM[2], 10);
+    }
 
     const postedM = rawText.match(/Posted\s+(\d+)\s+(minute|hour|day|week)s?\s+ago/i);
     if (postedM) {
@@ -463,7 +473,14 @@
       return { action: 'skip', reason: 'rating_too_low' };
     }
 
-    // 6. Too_old — v17.2.0 FRESH FIRST: >30 min = skip, никаких исключений.
+    // 6. Too_competitive — v18.0.1: proposals_min >= 20 = skip, не тратим токены.
+    // "20 to 50" на карточке = минимум 20 конкурентов уже там. Claude дорого, смысла нет.
+    // proposals_min=null (не извлеклось) — не режем, пусть Match Agent решает.
+    if (typeof job.proposals_min === 'number' && job.proposals_min >= 20) {
+      return { action: 'skip', reason: 'too_competitive' };
+    }
+
+    // 7. Too_old — v17.2.0 FRESH FIRST: >30 min = skip, никаких исключений.
     // Старые вакансии = 50+ proposals = Top Rated уже там. Смысла нет.
     // Если >30 min висит — либо никто нормальный не идёт (мусор), либо толпа (мы не конкурент).
     if (typeof job.posted_ago_min === 'number' && job.posted_ago_min > 30) {
@@ -714,6 +731,8 @@
             client_spent_rough: data.client_spent_rough ?? null,
             payment_verified: data.payment_verified ?? null,
             posted_ago_min: data.posted_ago_min ?? null,
+            // v18.0.1: proposals count lower bound (skip if >=20)
+            proposals_min: data.proposals_min ?? null,
             // v17.1.6: Upwork matched skills (.highlight-color)
             matched_skills: data.matched_skills ?? 0,
             total_skills: data.total_skills ?? 0,
