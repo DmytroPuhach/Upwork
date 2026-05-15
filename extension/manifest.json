@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "OptimizeUp Agency Assistant",
-  "version": "18.0.2",
-  "description": "Internal agency tool for OptimizeUp team - v18.0.2 Close enrich tab unless explicitly in bidding_accounts (was keeping on timeout/error).",
+  "version": "18.0.3",
+  "description": "Internal agency tool for OptimizeUp team - v18.0.3 broadSeo regex fix: google->google(search|analytics|search console), no more false-positive on Google Ads jobs.",
   "permissions": ["storage", "alarms", "activeTab", "scripting", "tabs"],
   "host_permissions": [
     "https://www.upwork.com/*",
