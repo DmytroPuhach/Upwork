@@ -1,4 +1,4 @@
-﻿// OptimizeUp Extension v17.5.5 — Background Service Worker
+﻿// OptimizeUp Extension v17.6.0 — Background Service Worker
 // v17.1.3: debounce duplicate JOB_SCRAPED sends (was 3-5x parallel → 1 req/job),
 //   accept prematch_reason/prematch_score from content.js and pass to leadgen-v2
 //   (surfaces "skip: country" in dashboard instead of silent pending).
@@ -701,7 +701,16 @@ async function processOneJob(item, opts = {}) {
         description_chars: payload.description.length,
         duration_ms,
       });
-      console.log('[OU enrich] ✓', item.upwork_id, 'desc=', payload.description.length, 'srv=', data?.ok);
+      // v17.6.0: close tab if this account is not in the bidding list
+      const mySlug = cachedIdentity?.member?.slug;
+      const biddingAccounts = data?.bidding_accounts;
+      if (Array.isArray(biddingAccounts) && mySlug && !biddingAccounts.includes(mySlug)) {
+        try { await chrome.tabs.remove(tabId); } catch {}
+        console.log('[OU enrich] 🔒 tab closed —', mySlug, 'not bidding. Bidding:', biddingAccounts.join(', ') || 'none');
+      } else {
+        console.log('[OU enrich] 📌 tab kept —', mySlug, 'in bidding or no decision yet');
+      }
+      console.log('[OU enrich] ✓', item.upwork_id, 'desc=', payload.description.length, 'srv=', data?.ok, 'bidding=', (biddingAccounts || []).join(','));
     } catch (e) {
       await logEnrichmentEvent('post_failed', {
         upwork_job_id: item.upwork_id,

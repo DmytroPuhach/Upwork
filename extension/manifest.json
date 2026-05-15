@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "OptimizeUp Agency Assistant",
-  "version": "17.5.5",
-  "description": "Internal agency tool for OptimizeUp team - v17.5.5 Keep enrichment tab open after extraction.",
+  "version": "17.6.0",
+  "description": "Internal agency tool for OptimizeUp team - v17.6.0 Smart tab management: close if no bid, keep if matched.",
   "permissions": ["storage", "alarms", "activeTab", "scripting", "tabs"],
   "host_permissions": [
     "https://www.upwork.com/*",
