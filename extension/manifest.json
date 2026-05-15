@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "OptimizeUp Agency Assistant",
-  "version": "18.0.1",
-  "description": "Internal agency tool for OptimizeUp team - v18.0.1 Skip too_competitive: proposals>=20 on card = no enrichment, no AI tokens wasted.",
+  "version": "18.0.2",
+  "description": "Internal agency tool for OptimizeUp team - v18.0.2 Close enrich tab unless explicitly in bidding_accounts (was keeping on timeout/error).",
   "permissions": ["storage", "alarms", "activeTab", "scripting", "tabs"],
   "host_permissions": [
     "https://www.upwork.com/*",
