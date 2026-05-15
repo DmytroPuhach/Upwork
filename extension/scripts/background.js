@@ -798,6 +798,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     updatePreset(msg.payload || {}).then(r => sendResponse(r)).catch(e => sendResponse({ error: String(e) }));
     return true;
   }
+  if (msg?.type === 'TOGGLE_BIDDING') {
+    toggleBidding().then(r => sendResponse(r)).catch(e => sendResponse({ error: String(e) }));
+    return true;
+  }
   if (msg?.type === 'GET_SCRAPING_STATE') {
     chrome.storage.local.get(['scrapingActive', 'scrapingTabId', 'cachedIdentity'])
       .then(r => sendResponse({
@@ -883,6 +887,45 @@ async function stopScraping() {
   });
   console.log('[OU] ⏸ STOP scraping');
   return { ok: true };
+}
+
+async function toggleBidding() {
+  const { cachedIdentity } = await chrome.storage.local.get('cachedIdentity');
+  const slug = cachedIdentity?.member?.slug;
+  if (!slug) return { ok: false, error: 'account not identified' };
+
+  const current = !!cachedIdentity?.member?.is_bidding_enabled;
+  const next = !current;
+
+  try {
+    const res = await fetch(
+      `${SB_URL}/rest/v1/accounts?slug=eq.${encodeURIComponent(slug)}`,
+      {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'apikey': SB_SVC_KEY,
+          'Authorization': `Bearer ${SB_SVC_KEY}`,
+          'Content-Profile': 'upwork',
+          'Prefer': 'return=minimal',
+        },
+        body: JSON.stringify({ bidding_enabled: next }),
+      }
+    );
+    if (!res.ok) {
+      const txt = await res.text().catch(() => '');
+      return { ok: false, error: `HTTP ${res.status}: ${txt.substring(0, 100)}` };
+    }
+    // Update local cache so popup reflects immediately
+    if (cachedIdentity?.member) {
+      cachedIdentity.member.is_bidding_enabled = next;
+      await chrome.storage.local.set({ cachedIdentity });
+    }
+    console.log(`[OU] Bidding toggled: ${slug} → ${next ? 'ON' : 'OFF'}`);
+    return { ok: true, bidding_enabled: next };
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e) };
+  }
 }
 
 async function updatePreset(newPreset) {
