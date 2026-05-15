@@ -1,5 +1,7 @@
 ﻿
-// OptimizeUp Extension v17.1.3 — Content Script
+// OptimizeUp Extension v18.0.0 — Content Script
+// v18.0.0: Added notifications/my_stats page types; maybeTriggerProfileSync() fires
+//   PROFILE_SYNC_TRIGGER to background.js when user visits these pages.
 // v17.1.3: no functional change here — background.js now applies a search-page
 // prematch against blocked_countries (using client_country we already send)
 // and attaches prematch_reason to the ingest_only call. enrich.js now also
@@ -48,6 +50,8 @@
     if (/\/nx\/find-work/.test(p)) return 'jobs_search';
     if (/\/jobs\/[\w~]+/.test(p)) return 'job_detail';
     if (/\/nx\/proposals/.test(p)) return 'proposal_list';
+    if (/\/ab\/notifications/.test(p)) return 'notifications';    // v18
+    if (/\/nx\/my-stats/.test(p)) return 'my_stats';              // v18
     return 'other';
   }
 
@@ -777,6 +781,21 @@
   // OBSERVERS — 3s debounce in v17.0.4 (was 1.5s)
   // ═══════════════════════════════════════════════════════════
 
+  // v18: fire profile-sync inject for pages that carry account health data.
+  // background.js injects profile-sync.js into this tab immediately — no background tab needed.
+  const PROFILE_SYNC_PAGES = new Set(['notifications', 'proposal_list', 'my_stats']);
+  const profileSyncTriggeredUrls = new Set();
+
+  function maybeTriggerProfileSync() {
+    const pt = getPageType();
+    if (!PROFILE_SYNC_PAGES.has(pt)) return;
+    const key = location.pathname.replace(/\/$/, '');
+    if (profileSyncTriggeredUrls.has(key)) return;
+    profileSyncTriggeredUrls.add(key);
+    log(`📊 triggering profile-sync on ${pt}`);
+    chrome.runtime.sendMessage({ type: 'PROFILE_SYNC_TRIGGER', payload: { page_type: pt } }).catch(() => {});
+  }
+
   let debounceTimer = null;
   function debouncedRun() {
     clearTimeout(debounceTimer);
@@ -784,6 +803,7 @@
       const pt = getPageType();
       if (pt === 'messages') handleMessages();
       else if (pt === 'jobs_search') handleJobCards();
+      else maybeTriggerProfileSync();
     }, 3000);
   }
 
