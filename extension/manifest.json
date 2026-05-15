@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "OptimizeUp Agency Assistant",
-  "version": "17.6.1",
-  "description": "Internal agency tool for OptimizeUp team - v17.6.1 Fix desc_timeout: expanded selectors for Upwork DOM change.",
+  "version": "18.0.0",
+  "description": "Internal agency tool for OptimizeUp team - v18.0.0 Add notifications/proposals/my-stats sync: background-tab + on-demand inject; accounts.jss_current update.",
   "permissions": ["storage", "alarms", "activeTab", "scripting", "tabs"],
   "host_permissions": [
     "https://www.upwork.com/*",
