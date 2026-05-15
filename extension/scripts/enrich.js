@@ -1,4 +1,4 @@
-﻿// OptimizeUp Extension v17.1.0 — Job Enrichment Injectable
+// OptimizeUp Extension v17.1.0 — Job Enrichment Injectable
 // Runs once in a background tab that opened a single-job page.
 // Extracts full description + budget + client stats + screening Qs,
 // then self-terminates. NEVER exposes action-triggering code paths.
@@ -59,15 +59,45 @@
   }
 
   function extractDescription() {
-    // Strategy 1: data-test attribute (most stable across Upwork redesigns)
-    const s1 = qsText('[data-test="Description"], [data-test="job-description-text"], [data-test="description-text"]');
-    if (s1 && s1.length >= MIN_DESC_CHARS) return { text: s1, strategy: 'data-test' };
+    // Strategy 1: data-test / data-testid attribute (try all known Upwork variants)
+    const dataTestSelectors = [
+      '[data-test="Description"]',
+      '[data-test="job-description-text"]',
+      '[data-test="description-text"]',
+      '[data-test="JobDescription"]',
+      '[data-test="job-description"]',
+      '[data-testid="Description"]',
+      '[data-testid="JobDescription"]',
+      '[data-testid="job-description"]',
+      '[data-testid="job-description-text"]',
+      '[data-testid="description"]',
+    ];
+    for (const sel of dataTestSelectors) {
+      const s = qsText(sel);
+      if (s && s.length >= MIN_DESC_CHARS) return { text: s, strategy: 'data-test:' + sel };
+    }
 
     // Strategy 2: ARIA-labelled section
     const s2 = qsText('section[aria-labelledby*="description" i], section[aria-label*="description" i]');
     if (s2 && s2.length >= MIN_DESC_CHARS) return { text: s2, strategy: 'aria' };
 
-    // Strategy 3: semantic header + next sibling
+    // Strategy 3: Air3 design system + known class patterns
+    const classSelectors = [
+      '[class*="air3-description"]',
+      '[class*="JobDescription"]',
+      '[class*="job-description"]',
+      '[class*="RichText"]',
+      '[class*="rich-text"]',
+      '[class*="description-content"]',
+      '[class*="DescriptionContent"]',
+      '[class*="up-c-line-clamp"]',
+    ];
+    for (const sel of classSelectors) {
+      const s = qsText(sel);
+      if (s && s.length >= MIN_DESC_CHARS) return { text: s, strategy: 'class:' + sel };
+    }
+
+    // Strategy 4: semantic header + next sibling
     const headers = Array.from(document.querySelectorAll('h1, h2, h3, h4, h5'));
     for (const h of headers) {
       if (/^\s*(Job description|Description|About the (job|project|role))\s*$/i.test(h.textContent || '')) {
@@ -79,7 +109,7 @@
       }
     }
 
-    // Strategy 4: biggest <p> cluster
+    // Strategy 5: biggest <p> cluster
     const paragraphs = Array.from(document.querySelectorAll('p'))
       .map(p => ({ p, text: (p.textContent || '').trim() }))
       .filter(x => x.text.length > 100);
@@ -88,6 +118,25 @@
       const top = paragraphs[0];
       if (top.text.length >= MIN_DESC_CHARS) return { text: top.text, strategy: 'biggest-p' };
     }
+
+    // Strategy 6: biggest leaf-ish div/section in main content — catches SPA changes
+    // regardless of class names. Excludes nav/header/footer to avoid grabbing chrome.
+    try {
+      const pageLen = (document.body?.textContent || '').length;
+      const candidates = Array.from(document.querySelectorAll('div[class], section, article'))
+        .filter(el => {
+          if (el.closest('nav, header, footer, [role="navigation"]')) return false;
+          const t = (el.textContent || '').trim();
+          return t.length >= MIN_DESC_CHARS && t.length < pageLen * 0.55;
+        })
+        // prefer smaller containers (more specific) with more direct text
+        .sort((a, b) => a.children.length - b.children.length);
+      if (candidates.length > 0) {
+        const best = candidates[0];
+        const t = (best.textContent || '').trim();
+        if (t.length >= MIN_DESC_CHARS) return { text: t.substring(0, 10000), strategy: 'div-grab' };
+      }
+    } catch {}
 
     return { text: '', strategy: 'none' };
   }
