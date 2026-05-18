@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "OptimizeUp Agency Assistant",
-  "version": "19.0.0",
-  "description": "Internal agency tool for OptimizeUp team - v19.0.0: Fast Manual Triage Mode, no hourly caps, candidateBuffer 10/15min, processNextCandidate.",
+  "version": "19.0.1",
+  "description": "Internal agency tool for OptimizeUp team - v19.0.1: stale-job guard: reject >25min at enqueue, skip >30min actualAge (logged not silent).",
   "permissions": ["storage", "alarms", "activeTab", "scripting", "tabs"],
   "host_permissions": [
     "https://www.upwork.com/*",
