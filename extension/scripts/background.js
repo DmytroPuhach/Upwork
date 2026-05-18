@@ -1,9 +1,11 @@
-// OptimizeUp Extension v19.0.0 — Background Service Worker
+// OptimizeUp Extension v19.0.1 — Background Service Worker
+// v19.0.1: Fix stale-job guard — skip jobs where actualAge (posted + time in buffer) > 30 min (logged, not silent).
+//   Also addToBuffer() rejects items already >25 min old at enqueue time.
 // v19.0.0: Fast Manual Triage Mode — 4 independent pipeline stages.
 //   JobWatcher (content.js) → PreMatcher (content.js prematchDecide) → JobReviewer (reviewJob) → CoverGenerator (leadgen-v2)
 //   Removed: hourly caps, 30s-5min delays, dual in-flight flags, enrichLogCircuit, prerank top-10, ENRICH_MAX_QUEUE=50
 //   Added: CONFIG, activeJobLock, candidateBuffer (max 10, TTL 15min), processNextCandidate(), reviewJob()
-//   Explicit log tags: FOUND | PRECHECK_PASSED | SKIPPED | OPENED | MATCHED | CLOSED_NOT_MATCH | ERROR
+//   Explicit log tags: FOUND | SKIPPED | OPENED | MATCHED | CLOSED_NOT_MATCH | ERROR
 
 const SB_URL = 'https://nsmcaexdqbipusjuzfht.supabase.co';
 const SB_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5zbWNhZXhkcWJpcHVzanV6Zmh0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM3MzcxMzcsImV4cCI6MjA4OTMxMzEzN30.SNZmkdBscH23J29nTfwd3luKc5MYyPXnNkp2eNxFU1Y';
@@ -18,9 +20,11 @@ console.log('[OU] Background loaded — version', EXT_VERSION);
 // ═══════════════════════════════════════════════════════════
 
 const CONFIG = {
-  version: '19.0.0',
+  version: '19.0.1',
   bufferMaxSize: 10,              // max candidates in live buffer
-  bufferTtlMs: 15 * 60 * 1000,   // drop candidates older than 15 min
+  bufferTtlMs: 15 * 60 * 1000,   // drop candidates older than 15 min in buffer
+  maxJobAgeMin: 25,               // reject jobs already >25 min old at enqueue time
+  maxActualAgeMin: 30,            // skip if posted_ago_min + time_in_buffer > 30 min (logged)
   tabTimeoutMs: 30 * 1000,        // hard timeout per job tab
   postLoadDelayMin: 1000,         // min delay after tab loads before inject
   postLoadDelayMax: 3000,         // max delay after tab loads before inject
@@ -295,6 +299,11 @@ async function addToBuffer(items) {
       console.log(`[OU] SKIPPED ${it.upwork_id} — buffer full (${CONFIG.bufferMaxSize})`);
       continue;
     }
+    // Reject jobs already too old at enqueue time — no point opening them
+    if (typeof it.posted_ago_min === 'number' && it.posted_ago_min > CONFIG.maxJobAgeMin) {
+      console.log(`[OU] SKIPPED ${it.upwork_id} — too_old at enqueue (${it.posted_ago_min}m > ${CONFIG.maxJobAgeMin}m)`);
+      continue;
+    }
     buf.push({
       upwork_id: it.upwork_id,
       url: normalizeJobUrl(it.url),
@@ -366,7 +375,17 @@ async function processNextCandidate() {
 // reviewJob — Stage 3: open tab, inject enrich.js, send to pipeline
 async function reviewJob(item) {
   const startedAt = Date.now();
-  console.log(`[OU] OPENED ${item.upwork_id} — "${item.title?.substring(0, 60)}" (age=${item.posted_ago_min}m)`);
+
+  // Guard: skip if job aged past threshold while sitting in buffer
+  const timeInBufferMin = (Date.now() - (item.queued_at ?? Date.now())) / 60000;
+  const actualAgeMin = (item.posted_ago_min ?? 0) + timeInBufferMin;
+  if (actualAgeMin > CONFIG.maxActualAgeMin) {
+    console.log(`[OU] SKIPPED ${item.upwork_id} — stale in buffer (posted ${Math.round(item.posted_ago_min ?? 0)}m + ${Math.round(timeInBufferMin)}m wait = ${Math.round(actualAgeMin)}m)`);
+    logEvent('failed', { upwork_job_id: item.upwork_id, error_type: 'too_old_in_buffer', error_detail: `actualAge=${Math.round(actualAgeMin)}m`, duration_ms: 0 });
+    return;
+  }
+
+  console.log(`[OU] OPENED ${item.upwork_id} — "${item.title?.substring(0, 60)}" (age=${Math.round(actualAgeMin)}m)`);
 
   let tabId = null;
   let settled = false;
