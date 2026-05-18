@@ -145,19 +145,43 @@
   // during enrichment → rows got title="unknown" if ingest_only arrived after
   // enrichment (race). Now we always send title in the enrichment payload.
   function extractTitle() {
+    // Strategy 0: Nuxt3 SSR state \u2014 most reliable, available before React hydration
+    try {
+      const nuxtData = window.__NUXT_DATA__ || window.__NUXT__?.state || null;
+      if (Array.isArray(nuxtData)) {
+        for (let i = 0; i < Math.min(nuxtData.length, 300); i++) {
+          const v = nuxtData[i];
+          if (typeof v === 'string' && v.length >= 5 && v.length <= 300 &&
+              !/upwork|login|sign|search|find|job|home|talent/i.test(v) &&
+              /[a-zA-Z]{3,}/.test(v) && !/^https?:\/\//.test(v)) {
+            // Heuristic: job titles are strings without URL-like patterns, not UI labels
+            const lv = v.toLowerCase();
+            if (!['null','undefined','true','false'].includes(lv) && !/^\d+$/.test(v)) {
+              // Check if adjacent items look like a job record (has description nearby)
+              const ctx = nuxtData.slice(Math.max(0, i-5), Math.min(nuxtData.length, i+10));
+              const hasDesc = ctx.some(c => typeof c === 'string' && c.length > 200);
+              if (hasDesc) { return v.substring(0, 500); }
+            }
+          }
+        }
+      }
+    } catch {}
+
     // Strategy 1: data-test attributes on the H1 or its wrapper
-    const s1 = qsText('h1[data-test="job-title"], h1[data-test="JobTitle"], [data-test="job-title"] h1, [data-test="JobTitle"] h1');
+    const s1 = qsText('h1[data-test="job-title"], h1[data-test="JobTitle"], [data-test="job-title"] h1, [data-test="JobTitle"] h1, h1[class*="title" i], h1[class*="Title"]');
     if (s1) return s1.substring(0, 500);
 
     // Strategy 2: H1 inside the job header section
-    const s2 = qsText('section[data-test="JobDetails"] h1, header h1, main h1');
+    const s2 = qsText('section[data-test="JobDetails"] h1, header h1, main h1, [class*="JobDetails"] h1, [class*="job-detail"] h1');
     if (s2) return s2.substring(0, 500);
 
-    // Strategy 3: any first H1 with reasonable length
-    const h1 = document.querySelector('h1');
-    if (h1) {
-      const t = (h1.textContent || '').trim();
-      if (t.length >= 5 && t.length <= 500) return t;
+    // Strategy 3: all H1s \u2014 pick the one that looks like a job title (not nav/UI)
+    const allH1 = Array.from(document.querySelectorAll('h1'));
+    for (const h of allH1) {
+      const t = (h.textContent || '').trim();
+      if (t.length >= 5 && t.length <= 300 && !/^(sign|log|find|search|home|upwork|jobs|talent)/i.test(t)) {
+        return t.substring(0, 500);
+      }
     }
 
     // Strategy 4: document.title, strip Upwork suffix
@@ -166,6 +190,13 @@
       .replace(/\s*\|\s*Upwork.*$/i, '')
       .trim();
     if (dt && dt.length >= 5 && !/^Upwork/i.test(dt)) return dt.substring(0, 500);
+
+    // Strategy 5: URL path slug \u2014 /jobs/~xxx/seo-expert-needed \u2192 "Seo Expert Needed"
+    const slugMatch = location.pathname.match(/\/jobs\/~[\w]+\/([^/?#]+)/);
+    if (slugMatch) {
+      const slug = slugMatch[1].replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase()).trim();
+      if (slug.length >= 5) return slug.substring(0, 500);
+    }
 
     return null;
   }
@@ -362,7 +393,8 @@
   }
 
   function extractUpworkJobId() {
-    const m = location.pathname.match(/~[\w]{15,25}/);
+    // v18.0.7: widened from {15,25} to match content.js — keeps IDs consistent
+    const m = location.pathname.match(/~[\w]{10,25}/);
     return m ? m[0] : null;
   }
 
