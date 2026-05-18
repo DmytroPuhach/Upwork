@@ -1,4 +1,4 @@
-// OptimizeUp Extension v18.0.0 — Background Service Worker
+// OptimizeUp Extension v18.0.10 — Background Service Worker
 // v18.0.0: Added /ab/notifications/ to profile-sync (DOM scrape — viewed/hired events).
 //   PROFILE_SYNC_TRIGGER message: content.js injects profile-sync.js on-demand
 //   when user navigates to notifications/proposals/my-stats pages.
@@ -901,8 +901,9 @@ async function toggleBidding() {
   const next = !current;
 
   try {
+    // Fix: PATCH team_members (slug=davyd) not accounts (slug=david — different slug)
     const res = await fetch(
-      `${SB_URL}/rest/v1/accounts?slug=eq.${encodeURIComponent(slug)}`,
+      `${SB_URL}/rest/v1/team_members?slug=eq.${encodeURIComponent(slug)}`,
       {
         method: 'PATCH',
         headers: {
@@ -912,7 +913,7 @@ async function toggleBidding() {
           'Content-Profile': 'upwork',
           'Prefer': 'return=minimal',
         },
-        body: JSON.stringify({ bidding_enabled: next }),
+        body: JSON.stringify({ is_bidding_enabled: next }),
       }
     );
     if (!res.ok) {
