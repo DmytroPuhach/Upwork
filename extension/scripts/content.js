@@ -1,4 +1,4 @@
-﻿
+
 // OptimizeUp Extension v18.0.3 — Content Script
 // v18.0.3: broadSeo regex — removed \bgoogle\b (matched "Google Ads" = PPC), tightened to google (search|analytics|search console) + organic traffic/search
 // v18.0.0: Added notifications/my_stats page types; maybeTriggerProfileSync() fires
@@ -113,6 +113,12 @@
   function parseBudget(raw) {
     if (!raw) return { type: null, min: null, max: null };
     const r = raw.toLowerCase();
+    // "Hourly: $10.00 - $20.00" \u2014 Upwork search card prefix format (hourly keyword BEFORE numbers)
+    const hourlyPfxRange = r.match(/hourly[:\s]+\$\s*([\d.,]+)\s*[-\u2013]\s*\$?\s*([\d.,]+)/);
+    if (hourlyPfxRange) return { type: 'hourly', min: parseFloat(hourlyPfxRange[1].replace(/,/g, '')), max: parseFloat(hourlyPfxRange[2].replace(/,/g, '')) };
+    const hourlyPfxSingle = r.match(/hourly[:\s]+\$\s*([\d.,]+)/);
+    if (hourlyPfxSingle) { const v = parseFloat(hourlyPfxSingle[1].replace(/,/g, '')); return { type: 'hourly', min: v, max: v }; }
+    // "$10.00 - $20.00 /hr" \u2014 suffix format
     const hourlyRange = r.match(/\$\s*([\d.,]+)\s*[-\u2013]\s*\$?\s*([\d.,]+)\s*(?:\/\s*h|hr|hour|hourly)/);
     if (hourlyRange) return { type: 'hourly', min: parseFloat(hourlyRange[1].replace(/,/g, '')), max: parseFloat(hourlyRange[2].replace(/,/g, '')) };
     const hourlySingle = r.match(/\$\s*([\d.,]+)\s*(?:\/\s*h|hr|hour|hourly)/);
@@ -465,6 +471,16 @@
       const hasMatching = matched >= 1;  // Upwork сам отметил skill overlap
       const hasBroadSeo = broadSeo;      // title/desc упоминает SEO
       if (!hasHistory && !hasMatching && !hasBroadSeo) {
+        return { action: 'skip', reason: 'budget_too_low' };
+      }
+    }
+
+    // 4b. Hourly rate too low — Expert SEO/GEO work under $25/hr is not viable
+    if (job.budget_type === 'hourly' && typeof job.budget_max === 'number' &&
+        job.budget_max > 0 && job.budget_max < 25) {
+      const hasHistory = typeof job.client_spent_rough === 'number' && job.client_spent_rough > 500;
+      const hasMatching = matched >= 1;
+      if (!hasHistory && !hasMatching) {
         return { action: 'skip', reason: 'budget_too_low' };
       }
     }
