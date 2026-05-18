@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "OptimizeUp Agency Assistant",
-  "version": "18.0.10",
-  "description": "Internal agency tool for OptimizeUp team - v18.0.10 fix: toggleBidding patches team_members not accounts (slug mismatch fixed).",
+  "version": "19.0.0",
+  "description": "Internal agency tool for OptimizeUp team - v19.0.0: Fast Manual Triage Mode, no hourly caps, candidateBuffer 10/15min, processNextCandidate.",
   "permissions": ["storage", "alarms", "activeTab", "scripting", "tabs"],
   "host_permissions": [
     "https://www.upwork.com/*",
