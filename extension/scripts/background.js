@@ -1,4 +1,4 @@
-﻿// OptimizeUp Extension v18.0.0 — Background Service Worker
+// OptimizeUp Extension v18.0.0 — Background Service Worker
 // v18.0.0: Added /ab/notifications/ to profile-sync (DOM scrape — viewed/hired events).
 //   PROFILE_SYNC_TRIGGER message: content.js injects profile-sync.js on-demand
 //   when user navigates to notifications/proposals/my-stats pages.
@@ -695,6 +695,7 @@ async function processOneJob(item, opts = {}) {
           machine_id: machineId,
           account_slug: cachedIdentity?.member?.slug,
           enrichment: payload,
+          search_title: item.title || null,  // fallback if enrich.js can't extract title
           matched_skills: Number(item.matched_skills) || 0,
           total_skills: Number(item.total_skills) || 0,
         }),
@@ -728,6 +729,8 @@ async function processOneJob(item, opts = {}) {
     return;
   }
 
+  // Close tab on failure — don't leave orphaned tabs open
+  if (tabId) { try { await chrome.tabs.remove(tabId); } catch {} }
   await logEnrichmentEvent('failed', {
     upwork_job_id: item.upwork_id,
     error_type: payload?.error_type || 'unknown',
