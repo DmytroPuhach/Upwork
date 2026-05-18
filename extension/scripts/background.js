@@ -1,4 +1,7 @@
-// OptimizeUp Extension v19.0.1 — Background Service Worker
+// OptimizeUp Extension v19.0.2 — Background Service Worker
+// v19.0.2: Zero-delay pipeline drain — after each job, immediately start next (no setTimeout).
+//   handleJobsCandidates adds backup retry in 3s so lock contention never strands jobs.
+//   bufferTtlMs reduced 15min → 5min (stale cleanup, not a delay).
 // v19.0.1: Fix stale-job guard — skip jobs where actualAge (posted + time in buffer) > 30 min (logged, not silent).
 //   Also addToBuffer() rejects items already >25 min old at enqueue time.
 // v19.0.0: Fast Manual Triage Mode — 4 independent pipeline stages.
@@ -20,9 +23,9 @@ console.log('[OU] Background loaded — version', EXT_VERSION);
 // ═══════════════════════════════════════════════════════════
 
 const CONFIG = {
-  version: '19.0.1',
+  version: '19.0.2',
   bufferMaxSize: 10,              // max candidates in live buffer
-  bufferTtlMs: 15 * 60 * 1000,   // drop candidates older than 15 min in buffer
+  bufferTtlMs: 5 * 60 * 1000,    // drop candidates older than 5 min in buffer
   maxJobAgeMin: 25,               // reject jobs already >25 min old at enqueue time
   maxActualAgeMin: 30,            // skip if posted_ago_min + time_in_buffer > 30 min (logged)
   tabTimeoutMs: 30 * 1000,        // hard timeout per job tab
@@ -366,10 +369,8 @@ async function processNextCandidate() {
     logEvent('error', { upwork_job_id: item.upwork_id, error_type: 'exception', error_detail: String(e?.message || e) });
   } finally {
     activeJobLock = false;
+    processNextCandidate().catch(() => {});  // immediate drain — no delay
   }
-
-  // Check for next item immediately — no artificial inter-job delay
-  setTimeout(() => processNextCandidate().catch(() => {}), 1000);
 }
 
 // reviewJob — Stage 3: open tab, inject enrich.js, send to pipeline
@@ -534,6 +535,7 @@ async function handleJobsCandidates(payload) {
   console.log(`[OU] buffer: +${added} added, ${buf.length}/${CONFIG.bufferMaxSize} total`);
 
   processNextCandidate().catch(() => {});
+  setTimeout(() => processNextCandidate().catch(() => {}), 3000);  // backup if lock was held
 
   return { ok: true, added, total_candidates: jobs.length, stripped_blocked: strippedBlocked };
 }
