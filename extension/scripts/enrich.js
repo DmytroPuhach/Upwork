@@ -191,10 +191,16 @@
       .trim();
     if (dt && dt.length >= 5 && !/^Upwork/i.test(dt)) return dt.substring(0, 500);
 
-    // Strategy 5: URL path slug \u2014 /jobs/~xxx/seo-expert-needed \u2192 "Seo Expert Needed"
-    const slugMatch = location.pathname.match(/\/jobs\/~[\w]+\/([^/?#]+)/);
-    if (slugMatch) {
-      const slug = slugMatch[1].replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase()).trim();
+    // Strategy 5a: new Upwork URL format \u2014 /jobs/Title-Slug_~ID/ (title BEFORE the ~ID)
+    const newFmtMatch = location.pathname.match(/\/jobs\/(.+?)_~[\w]{10,}/);
+    if (newFmtMatch) {
+      const slug = newFmtMatch[1].replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase()).trim();
+      if (slug.length >= 5) return slug.substring(0, 500);
+    }
+    // Strategy 5b: old URL format \u2014 /jobs/~ID/title-slug
+    const oldFmtMatch = location.pathname.match(/\/jobs\/~[\w]+\/([^/?#]+)/);
+    if (oldFmtMatch) {
+      const slug = oldFmtMatch[1].replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase()).trim();
       if (slug.length >= 5) return slug.substring(0, 500);
     }
 
