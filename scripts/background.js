@@ -1,4 +1,5 @@
-// OptimizeUp Extension v19.0.4 — Background Service Worker
+// OptimizeUp Extension v19.0.5 — Background Service Worker
+// v19.0.5: Add Authorization: Bearer header to all edge function fetch calls (leadgen-v2, extension-job-enrich — were returning 401 silently).
 // v19.0.4: Remove quiet hours from processNextCandidate() — pipeline now runs 24/7 while bidding enabled.
 // v19.0.3: Removed quiet hours + scrape_settings gate — reload fires every 60s while bidding enabled.
 // v19.0.2: Zero-delay pipeline drain — after each job, immediately start next (no setTimeout).
@@ -311,7 +312,7 @@ async function logEvent(status, details) {
     const { machineId, cachedIdentity } = await chrome.storage.local.get(['machineId', 'cachedIdentity']);
     fetch(`${SB_URL}/functions/v1/extension-job-enrich/log`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SB_ANON_KEY}` },
       body: JSON.stringify({
         machine_id: machineId,
         account_slug: cachedIdentity?.member?.slug,
@@ -440,7 +441,7 @@ async function reviewJob(item) {
     try {
       const res = await fetch(`${SB_URL}/functions/v1/extension-job-enrich`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SB_ANON_KEY}` },
         body: JSON.stringify({
           machine_id: machineId,
           account_slug: cachedIdentity?.member?.slug,
@@ -875,7 +876,7 @@ async function handleScrapedJobSkip(payload) {
   };
 
   fetch(`${SB_URL}/functions/v1/leadgen-v2`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SB_ANON_KEY}` }, body: JSON.stringify(body)
   }).catch(() => {});
 
   const today = new Date().toDateString();
@@ -916,7 +917,7 @@ async function handleScrapedJob(payload) {
   }
 
   fetch(`${SB_URL}/functions/v1/leadgen-v2`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SB_ANON_KEY}` }, body: JSON.stringify(body)
   }).catch(() => {});
 
   const today = new Date().toDateString();
