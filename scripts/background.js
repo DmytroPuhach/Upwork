@@ -1,4 +1,5 @@
-// OptimizeUp Extension v19.0.3 — Background Service Worker
+// OptimizeUp Extension v19.0.4 — Background Service Worker
+// v19.0.4: Remove quiet hours from processNextCandidate() — pipeline now runs 24/7 while bidding enabled.
 // v19.0.3: Removed quiet hours + scrape_settings gate — reload fires every 60s while bidding enabled.
 // v19.0.2: Zero-delay pipeline drain — after each job, immediately start next (no setTimeout).
 //   handleJobsCandidates adds backup retry in 3s so lock contention never strands jobs.
@@ -330,8 +331,6 @@ async function processNextCandidate() {
   ]);
   if (pausedUntilUpdate) return;
   if (!cachedIdentity?.member?.is_bidding_enabled) return;
-  if (cachedIdentity?.scrape_settings?.pattern_mode === 'paused') return;
-  if (isInQuietHours(cachedIdentity)) return;
 
   const buf = await clearStaleBuffer();
   if (buf.length === 0) return;
