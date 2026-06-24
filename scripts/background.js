@@ -1,4 +1,5 @@
-// OptimizeUp Extension v19.1.1 — Background Service Worker
+// OptimizeUp Extension v19.2.0 — Background Service Worker
+// v19.2.0: detectUpworkUser — read Nuxt-serialized ~01 cipher from inline scripts (new Upwork UI).
 // v19.1.1: outbound message call now sends machine_id (server authenticates it against extension_status).
 // v19.1.0: STEP 0 SECURITY — REMOVED service_role key from extension. toggleBidding now calls
 //   extension-config/toggle-bidding; outbound messages call extension-job-enrich/outbound — both with anon key.
@@ -62,6 +63,15 @@ async function detectUpworkUser() {
           target: { tabId: tab.id },
           func: () => {
             try {
+              // v18.0.7: current Upwork (Nuxt SSR) — the logged-in user cipher (~01xxxxxxxxxxxxxxxx)
+              // is serialized into inline <script> state, readable from the isolated world.
+              // Job uids start ~02, so anchoring on ~01 avoids grabbing a job id.
+              for (const s of document.querySelectorAll('script')) {
+                const txt = s.textContent || '';
+                if (txt.length < 50) continue;
+                const m = txt.match(/~01[0-9a-f]{14,18}/);
+                if (m) return { uid: m[0], method: 'nuxt-cipher' };
+              }
               if (window.USER_DATA?.cipherUid) return { uid: window.USER_DATA.cipherUid, method: 'window.USER_DATA' };
               if (window.USER?.cipher) return { uid: window.USER.cipher, method: 'window.USER' };
               const metaUid = document.querySelector('meta[name="user-id"], meta[name="cipher-uid"]')?.content;

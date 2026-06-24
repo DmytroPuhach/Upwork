@@ -1,5 +1,8 @@
 
-// OptimizeUp Extension v18.0.4 — Content Script
+// OptimizeUp Extension v18.0.7 — Content Script
+// v18.0.7: new Upwork (Nuxt) search UI — JOB_STRATEGIES 'data-test' tile [data-test="JobTile"];
+//   card fields via data-test (job-type-label/location/token); extractCardHints rating "Rating is X out of 5"
+//   + proposals "Fewer than N".
 // v18.0.4: city→country normalization in prematchDecide (Lahore→Pakistan, strips "City HH:MM PM" suffix)
 // v18.0.3: broadSeo regex — removed \bgoogle\b (matched "Google Ads" = PPC), tightened to google (search|analytics|search console) + organic traffic/search
 // v18.0.0: Added notifications/my_stats page types; maybeTriggerProfileSync() fires
@@ -346,6 +349,14 @@
         if (n >= 1 && n <= 5) out.client_rating = n;
       }
     }
+    if (out.client_rating == null) {
+      // v18.0.7: current Nuxt UI renders rating as text "Rating is 5.0 out of 5"
+      const m = rawText.match(/Rating is\s+([\d.]+)\s+out of 5/i);
+      if (m) {
+        const n = parseFloat(m[1]);
+        if (n >= 1 && n <= 5) out.client_rating = n;
+      }
+    }
 
     // Total spent
     const spentM = rawText.match(/\$([\d,.]+)\s*([KkMm])?\+?\s*(?:total\s+)?spent/i);
@@ -363,7 +374,7 @@
     // v18.0.1: proposals count from search card — used by prematch to skip crowded jobs
     // Upwork shows: "Less than 5", "5 to 10", "10 to 15", "15 to 20", "20 to 50", "50+"
     out.proposals_min = null;
-    const propM = rawText.match(/Proposals?:\s*(?:Less than\s*(\d+)|(\d+)\s*(?:to\s*\d+|\+))/i);
+    const propM = rawText.match(/Proposals?:\s*(?:(?:Less|Fewer) than\s*(\d+)|(\d+)\s*(?:to\s*\d+|\+))/i);
     if (propM) {
       // "Less than 5" → min=0; "5 to 10" or "50+" → min=first number
       out.proposals_min = propM[1] ? 0 : parseInt(propM[2], 10);
@@ -530,6 +541,28 @@
   }
 
   const JOB_STRATEGIES = [
+    {
+      // v18.0.7: current Upwork (Nuxt) search UI — cards are <article data-test="JobTile">.
+      // Fields moved to data-test: job-type-label (budget), location, token (skills),
+      // job-tile-title-link (title). data-testid is gone.
+      name: 'data-test',
+      find: () => document.querySelectorAll('article[data-test="JobTile"], [data-test="JobTile"]'),
+      extract: (el) => {
+        const titleA = el.querySelector('a[data-test*="job-tile-title-link"], h2 a, a[href*="/jobs/"]');
+        const country = el.querySelector('[data-test="location"]')?.textContent?.trim() || null;
+        const hints = extractCardHints(el);
+        return {
+          title: titleA?.textContent?.trim(),
+          url: titleA?.href,
+          description: el.querySelector('[data-test="JobDescription"], [data-test="Description"], p')?.textContent?.trim()?.substring(0, 3000),
+          budget: el.querySelector('[data-test="job-type-label"]')?.textContent?.trim(),
+          country,
+          skills: Array.from(el.querySelectorAll('[data-test="token"], .air3-token')).map(s => s.textContent.trim()).filter(Boolean).slice(0, 20),
+          raw_text: el.textContent?.trim()?.substring(0, 5000),
+          ...hints,
+        };
+      }
+    },
     {
       name: 'testid',
       find: () => document.querySelectorAll('[data-testid*="job-tile"], article[data-ev-sublocation-str*="job"]'),
