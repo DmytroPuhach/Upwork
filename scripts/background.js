@@ -1,4 +1,5 @@
-// OptimizeUp Extension v19.2.0 — Background Service Worker
+// OptimizeUp Extension v19.2.3 — Background Service Worker
+// v19.2.3: heartbeat logs HTTP status (diagnose network-fail vs server-reject for stale rows).
 // v19.2.0: detectUpworkUser — read Nuxt-serialized ~01 cipher from inline scripts (new Upwork UI).
 // v19.1.1: outbound message call now sends machine_id (server authenticates it against extension_status).
 // v19.1.0: STEP 0 SECURITY — REMOVED service_role key from extension. toggleBidding now calls
@@ -142,8 +143,10 @@ async function heartbeat() {
     const res = await fetch(`${SB_URL}/functions/v1/extension-config/heartbeat`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
     });
-    const data = await res.json();
-    console.log('[OU] Heartbeat OK');
+    const data = await res.json().catch(() => ({}));
+    // v19.2.3: log the actual HTTP status so a stale extension_status row can be
+    // diagnosed as network-fail (throw → catch) vs server reject (non-2xx here).
+    console.log(`[OU] Heartbeat → HTTP ${res.status} ${res.ok ? 'OK' : 'NON-OK'} (machine ${String(machineId).slice(0,8)} v${EXT_VERSION})`);
 
     if (body.scraper_error || lastScraperError) {
       await chrome.storage.local.remove('lastScraperError');

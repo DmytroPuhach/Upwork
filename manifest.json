@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "OptimizeUp Agency Assistant",
-  "version": "19.2.2",
-  "description": "Internal agency tool for OptimizeUp team - v19.2.2: fixed-price budget amount from is-fixed-price selector.",
+  "version": "19.2.3",
+  "description": "Internal agency tool for OptimizeUp team - v19.2.3: heartbeat logs HTTP status for connectivity diagnosis.",
   "permissions": ["storage", "alarms", "activeTab", "scripting", "tabs"],
   "host_permissions": [
     "https://www.upwork.com/*",
