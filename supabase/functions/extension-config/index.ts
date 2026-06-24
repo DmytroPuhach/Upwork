@@ -1,4 +1,6 @@
-// extension-config v8
+// extension-config v9
+// v9: SECURITY — /toggle-bidding now authenticates caller via machine_id in extension_status
+//     (anon key is public). Machine may only toggle its OWN account; body.slug ignored for auth.
 // v8: STEP 0 — secrets to Deno.env; + /toggle-bidding route (extension no longer holds service_role).
 // v7: include account.timezone in /identify response (client uses it for quiet_hours)
 // v6: + /preset endpoint (POST) to update account.scrape_preset from popup.
@@ -202,23 +204,23 @@ Deno.serve(async (req) => {
     }
 
     if (path === 'toggle-bidding') {
-      // STEP 0: extension no longer holds service_role. It calls this with anon key.
-      // Flips team_members.is_bidding_enabled (single source of truth).
+      // Extension calls this with the (public) anon key, so the anon key alone is NOT
+      // proof of identity. Caller is authenticated by machine_id existing in
+      // extension_status (same pattern as /preset). A machine may only toggle bidding
+      // for ITS OWN account — body.slug is ignored for authorization.
       if (req.method !== 'POST') return cors({ error: 'POST only' }, 405);
       const body = await req.json();
       const machine_id = body.machine_id;
-      let slug = (body.slug || '').toLowerCase();
       const enabled = body.enabled === true ? true : body.enabled === false ? false : null;
+      if (!machine_id) return cors({ error: 'need machine_id' }, 400);
       if (enabled === null) return cors({ error: 'need enabled:boolean' }, 400);
 
-      // Resolve slug from machine if not provided
-      if (!slug && machine_id) {
-        const { data: ext } = await sb.from('extension_status').select('account_slug').eq('machine_id', machine_id).maybeSingle();
-        if (ext?.account_slug) slug = String(ext.account_slug).toLowerCase();
-      }
-      if (!slug) return cors({ error: 'account not resolvable (need slug or known machine_id)' }, 404);
+      // AUTH: machine must be registered (heartbeat) — resolves its own account_slug.
+      const { data: ext } = await sb.from('extension_status').select('account_slug').eq('machine_id', machine_id).maybeSingle();
+      if (!ext?.account_slug) return cors({ error: 'unknown machine' }, 403);
+      const slug = String(ext.account_slug).toLowerCase();
 
-      // Find member by slug, then alias fallback
+      // Find member by the machine's own slug, then alias fallback
       let { data: member } = await sb.from('team_members').select('id, slug').eq('slug', slug).maybeSingle();
       if (!member) {
         const { data: byAlias } = await sb.from('team_members').select('id, slug').contains('aliases', [slug]).maybeSingle();

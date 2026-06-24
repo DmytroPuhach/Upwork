@@ -1,4 +1,5 @@
-// OptimizeUp Extension v19.1.0 — Background Service Worker
+// OptimizeUp Extension v19.1.1 — Background Service Worker
+// v19.1.1: outbound message call now sends machine_id (server authenticates it against extension_status).
 // v19.1.0: STEP 0 SECURITY — REMOVED service_role key from extension. toggleBidding now calls
 //   extension-config/toggle-bidding; outbound messages call extension-job-enrich/outbound — both with anon key.
 // v19.0.5: Add Authorization: Bearer header to all edge function fetch calls (leadgen-v2, extension-job-enrich — were returning 401 silently).
@@ -763,13 +764,14 @@ async function handleInboundMessage(payload) {
 }
 
 async function handleOutboundMessage(payload) {
-  const { cachedIdentity } = await chrome.storage.local.get(['cachedIdentity']);
+  const { cachedIdentity, machineId } = await chrome.storage.local.get(['cachedIdentity', 'machineId']);
   if (!cachedIdentity?.member?.slug) return { skipped: 'no_identity' };
 
   const slug = cachedIdentity.member.slug;
   try {
     // STEP 0: route through edge function with anon key (no service_role in extension).
-    // Edge resolves account_id + client_id and inserts into messages_context.
+    // machine_id authenticates the caller server-side (validated against extension_status).
+    // Edge resolves account from the machine + client_id, then inserts into messages_context.
     const res = await fetch(`${SB_URL}/functions/v1/extension-job-enrich/outbound`, {
       method: 'POST',
       headers: {
@@ -777,6 +779,7 @@ async function handleOutboundMessage(payload) {
         'Authorization': `Bearer ${SB_ANON_KEY}`,
       },
       body: JSON.stringify({
+        machine_id: machineId,
         account_slug: slug,
         client_name: payload.client_name || '',
         text: payload.text || '',

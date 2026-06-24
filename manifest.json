@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "OptimizeUp Agency Assistant",
-  "version": "19.1.0",
-  "description": "Internal agency tool for OptimizeUp team - v19.1.0: security — service_role removed, privileged writes via edge functions.",
+  "version": "19.1.1",
+  "description": "Internal agency tool for OptimizeUp team - v19.1.1: privileged edge writes authenticated by machine_id (extension_status).",
   "permissions": ["storage", "alarms", "activeTab", "scripting", "tabs"],
   "host_permissions": [
     "https://www.upwork.com/*",

@@ -1,3 +1,5 @@
+// extension-job-enrich v7 — SECURITY: /outbound now authenticates caller via machine_id in
+//     extension_status (anon key is public); account taken from machine, body.account_slug ignored for auth.
 // extension-job-enrich v6 — STEP 0: secrets to Deno.env; + /outbound route (extension no longer holds service_role).
 // extension-job-enrich v5 — добавлено к v4:
 //   - принимает enrichment.screening_strategy (телеметрия какой selector сработал)
@@ -235,12 +237,21 @@ async function handleHaltAlert(req: Request): Promise<Response> {
 }
 
 // STEP 0: extension no longer holds service_role. Outbound chat messages are saved here.
+// The anon key is public (ships in the extension), so it is NOT proof of identity.
+// Caller is authenticated by machine_id existing in extension_status; the account is
+// taken from the machine's own registration — body.account_slug is ignored for auth.
 async function handleOutbound(req: Request): Promise<Response> {
   const sb = db();
   let body: any;
   try { body = await req.json(); } catch { return new Response('bad json', { status: 400 }); }
-  const slug = String(body.account_slug || '').toLowerCase();
-  if (!slug) return new Response(JSON.stringify({ skipped: 'no_slug' }), { status: 200 });
+
+  const machineId = body.machine_id;
+  if (!machineId) return new Response(JSON.stringify({ error: 'need machine_id' }), { status: 400 });
+
+  // AUTH: machine must be registered (heartbeat) — resolves its own account_slug.
+  const { data: ext } = await sb.from('extension_status').select('account_slug').eq('machine_id', machineId).maybeSingle();
+  if (!ext?.account_slug) return new Response(JSON.stringify({ error: 'unknown machine' }), { status: 403 });
+  const slug = String(ext.account_slug).toLowerCase();
 
   // Resolve account_id: accounts.slug, else team_members(slug|alias).account_id
   let accountId: string | null = null;
