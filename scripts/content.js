@@ -1,5 +1,7 @@
 
-// OptimizeUp Extension v18.0.7 — Content Script
+// OptimizeUp Extension v18.0.8 — Content Script
+// v18.0.8: JOB_STRATEGIES collapsed to ONE strategy (data-test="JobTile") — removed dead testid +
+//   noisy class-based + semantic fallbacks. Clean break > silent noise.
 // v18.0.7: new Upwork (Nuxt) search UI — JOB_STRATEGIES 'data-test' tile [data-test="JobTile"];
 //   card fields via data-test (job-type-label/location/token); extractCardHints rating "Rating is X out of 5"
 //   + proposals "Fewer than N".
@@ -562,76 +564,11 @@
           ...hints,
         };
       }
-    },
-    {
-      name: 'testid',
-      find: () => document.querySelectorAll('[data-testid*="job-tile"], article[data-ev-sublocation-str*="job"]'),
-      extract: (el) => {
-        const titleA = el.querySelector('h2 a, h3 a, a[href*="/jobs/"]');
-        // v17.1.5: country fallback chain — 4 стратегии
-        let country = el.querySelector('[data-test*="country"], [data-testid*="location"], [data-test*="location"]')?.textContent?.trim()
-                   || el.querySelector('[aria-label*="Location"]')?.getAttribute('aria-label')?.replace(/^Location[:\s]+/i, '').trim()
-                   || null;
-        if (!country) {
-          // Regex fallback — countries обычно в конце карточки после client stats
-          const m = (el.textContent || '').match(/(United States|United Kingdom|USA|UK|Canada|Australia|Germany|France|Switzerland|Netherlands|Spain|Italy|Sweden|Norway|Denmark|Finland|Belgium|Austria|Ireland|New Zealand|Singapore|Japan|United Arab Emirates|UAE|Israel|India|Pakistan|Bangladesh|Philippines|Vietnam|Indonesia|Nigeria|Kenya|Egypt|Morocco|Turkey|Brazil|Mexico|Argentina)\b/);
-          if (m) country = m[1];
-        }
-        const hints = extractCardHints(el);
-        return {
-          title: titleA?.textContent?.trim(),
-          url: titleA?.href,
-          description: el.querySelector('[data-test*="description"], p')?.textContent?.trim()?.substring(0, 3000),
-          budget: el.querySelector('[data-test*="budget"], [data-testid*="budget"]')?.textContent?.trim(),
-          country,
-          skills: Array.from(el.querySelectorAll('[data-test*="skill"], .air3-token')).map(s => s.textContent.trim()).filter(Boolean).slice(0, 20),
-          raw_text: el.textContent?.trim()?.substring(0, 5000),
-          ...hints,
-        };
-      }
-    },
-    {
-      name: 'class-based',
-      find: () => document.querySelectorAll('.job-tile, [class*="JobTile"], [class*="job-tile"]'),
-      extract: (el) => {
-        const titleA = el.querySelector('a[href*="/jobs/"]');
-        let country = el.querySelector('[class*="country"], [class*="Location"]')?.textContent?.trim() || null;
-        if (!country) {
-          const m = (el.textContent || '').match(/(United States|United Kingdom|USA|UK|Canada|Australia|Germany|France|Switzerland|Netherlands|India|Pakistan|Bangladesh|Philippines)\b/);
-          if (m) country = m[1];
-        }
-        const hints = extractCardHints(el);
-        return {
-          title: titleA?.textContent?.trim() || el.querySelector('h2, h3, h4')?.textContent?.trim(),
-          url: titleA?.href,
-          description: el.querySelector('[class*="description"], p')?.textContent?.trim()?.substring(0, 3000),
-          budget: el.querySelector('[class*="budget"], [class*="Budget"]')?.textContent?.trim(),
-          country,
-          skills: Array.from(el.querySelectorAll('[class*="token"], [class*="Skill"]')).map(s => s.textContent.trim()).filter(Boolean).slice(0, 20),
-          raw_text: el.textContent?.trim()?.substring(0, 5000),
-          ...hints,
-        };
-      }
-    },
-    {
-      name: 'semantic',
-      find: () => {
-        const arr = document.querySelectorAll('article, section, li');
-        return Array.from(arr).filter(el => el.querySelector('a[href*="/jobs/"]') && el.textContent.trim().length > 100);
-      },
-      extract: (el) => {
-        const a = el.querySelector('a[href*="/jobs/"]');
-        const hints = extractCardHints(el);
-        return {
-          title: a?.textContent?.trim(), url: a?.href,
-          description: el.textContent?.trim().substring(0, 1000),
-          budget: null, country: null, skills: [],
-          raw_text: el.textContent?.trim()?.substring(0, 5000),
-          ...hints,
-        };
-      }
     }
   ];
+  // v18.0.7: single strategy by design. data-test="JobTile" returns exactly the real cards.
+  // No testid/class-based/semantic fallbacks — they matched noise (60 = 10 cards + 50 fragments)
+  // or nothing. If Upwork changes the tile, we WANT a clean reportBroken, not silent garbage.
 
   function tryStrategies(strategies, minCount = 1) {
     for (const s of strategies) {
