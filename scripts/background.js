@@ -1,4 +1,6 @@
-// OptimizeUp Extension v19.0.5 — Background Service Worker
+// OptimizeUp Extension v19.1.0 — Background Service Worker
+// v19.1.0: STEP 0 SECURITY — REMOVED service_role key from extension. toggleBidding now calls
+//   extension-config/toggle-bidding; outbound messages call extension-job-enrich/outbound — both with anon key.
 // v19.0.5: Add Authorization: Bearer header to all edge function fetch calls (leadgen-v2, extension-job-enrich — were returning 401 silently).
 // v19.0.4: Remove quiet hours from processNextCandidate() — pipeline now runs 24/7 while bidding enabled.
 // v19.0.3: Removed quiet hours + scrape_settings gate — reload fires every 60s while bidding enabled.
@@ -15,8 +17,8 @@
 
 const SB_URL = 'https://nsmcaexdqbipusjuzfht.supabase.co';
 const SB_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5zbWNhZXhkcWJpcHVzanV6Zmh0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM3MzcxMzcsImV4cCI6MjA4OTMxMzEzN30.SNZmkdBscH23J29nTfwd3luKc5MYyPXnNkp2eNxFU1Y';
-// service_role key — SW context only, not accessible to web pages
-const SB_SVC_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5zbWNhZXhkcWJpcHVzanV6Zmh0Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MzczNzEzNywiZXhwIjoyMDg5MzEzMTM3fQ.8cziy072fTbGRO9A26PdHi5XOqonPJifCNyA1EeBhTo';
+// STEP 0: service_role key REMOVED from the extension. The extension must never hold it.
+// All privileged writes now go through edge functions authenticated with the anon key.
 const EXT_VERSION = chrome.runtime.getManifest().version;
 
 console.log('[OU] Background loaded — version', EXT_VERSION);
@@ -670,23 +672,19 @@ async function toggleBidding() {
 
   const current = !!cachedIdentity?.member?.is_bidding_enabled;
   const next = !current;
+  const { machineId } = await chrome.storage.local.get('machineId');
 
   try {
-    // PATCH team_members (slug=davyd) — accounts table has slug "david", different table
-    const res = await fetch(
-      `${SB_URL}/rest/v1/team_members?slug=eq.${encodeURIComponent(slug)}`,
-      {
-        method: 'PATCH',
-        headers: {
-          'Content-Type': 'application/json',
-          'apikey': SB_SVC_KEY,
-          'Authorization': `Bearer ${SB_SVC_KEY}`,
-          'Content-Profile': 'upwork',
-          'Prefer': 'return=minimal',
-        },
-        body: JSON.stringify({ is_bidding_enabled: next }),
-      }
-    );
+    // STEP 0: route through edge function with anon key (no service_role in extension).
+    // Edge flips team_members.is_bidding_enabled (single source of truth).
+    const res = await fetch(`${SB_URL}/functions/v1/extension-config/toggle-bidding`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${SB_ANON_KEY}`,
+      },
+      body: JSON.stringify({ machine_id: machineId, slug, enabled: next }),
+    });
     if (!res.ok) {
       const txt = await res.text().catch(() => '');
       return { ok: false, error: `HTTP ${res.status}: ${txt.substring(0, 100)}` };
@@ -769,43 +767,30 @@ async function handleOutboundMessage(payload) {
   if (!cachedIdentity?.member?.slug) return { skipped: 'no_identity' };
 
   const slug = cachedIdentity.member.slug;
-  const sbH = {
-    'apikey': SB_SVC_KEY,
-    'Authorization': `Bearer ${SB_SVC_KEY}`,
-    'Accept-Profile': 'upwork',
-    'Content-Profile': 'upwork',
-    'Content-Type': 'application/json',
-  };
-
-  const accRes = await fetch(`${SB_URL}/rest/v1/accounts?select=id&slug=eq.${encodeURIComponent(slug)}&limit=1`, { headers: sbH });
-  const accData = await accRes.json();
-  const accountId = accData?.[0]?.id;
-  if (!accountId) return { skipped: 'no_account', slug };
-
-  const nameQ = encodeURIComponent(payload.client_name || '');
-  const clientRes = await fetch(`${SB_URL}/rest/v1/clients?select=id&name=ilike.${nameQ}&limit=1`, { headers: sbH });
-  const clientData = await clientRes.json();
-  const clientId = clientData?.[0]?.id;
-  if (!clientId) return { skipped: 'client_not_found', name: payload.client_name };
-
-  const insertRes = await fetch(`${SB_URL}/rest/v1/messages_context`, {
-    method: 'POST',
-    headers: { ...sbH, 'Prefer': 'return=minimal' },
-    body: JSON.stringify({
-      client_id: clientId,
-      account_id: accountId,
-      message_direction: 'outbound',
-      raw_text: payload.text,
-      summary: payload.text?.substring(0, 300) || '',
-      story_id: payload.story_id || null,
-    }),
-  });
-
-  if (!insertRes.ok) {
-    const err = await insertRes.text();
-    return { error: `insert failed: ${err}` };
+  try {
+    // STEP 0: route through edge function with anon key (no service_role in extension).
+    // Edge resolves account_id + client_id and inserts into messages_context.
+    const res = await fetch(`${SB_URL}/functions/v1/extension-job-enrich/outbound`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${SB_ANON_KEY}`,
+      },
+      body: JSON.stringify({
+        account_slug: slug,
+        client_name: payload.client_name || '',
+        text: payload.text || '',
+        chat_url: payload.chat_url || null,
+      }),
+    });
+    if (!res.ok) {
+      const err = await res.text().catch(() => '');
+      return { error: `outbound failed: HTTP ${res.status} ${err.substring(0, 100)}` };
+    }
+    return await res.json();
+  } catch (e) {
+    return { error: String(e?.message || e) };
   }
-  return { ok: true, saved: 'outbound', client: payload.client_name };
 }
 
 // ═══════════════════════════════════════════════════════════
