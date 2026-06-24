@@ -1,5 +1,7 @@
 
-// OptimizeUp Extension v18.0.8 — Content Script
+// OptimizeUp Extension v18.0.9 — Content Script
+// v18.0.9: fixed-price budget amount from [data-test="is-fixed-price"] (job-type-label has type only
+//   for fixed); combined with job-type-label so parseBudget gets the amount without raw_text pollution.
 // v18.0.8: JOB_STRATEGIES collapsed to ONE strategy (data-test="JobTile") — removed dead testid +
 //   noisy class-based + semantic fallbacks. Clean break > silent noise.
 // v18.0.7: new Upwork (Nuxt) search UI — JOB_STRATEGIES 'data-test' tile [data-test="JobTile"];
@@ -552,12 +554,18 @@
       extract: (el) => {
         const titleA = el.querySelector('a[data-test*="job-tile-title-link"], h2 a, a[href*="/jobs/"]');
         const country = el.querySelector('[data-test="location"]')?.textContent?.trim() || null;
+        // budget: job-type-label carries the HOURLY range ("Hourly: $20-$30"); for FIXED it's just
+        // the word "Fixed price" and the amount lives in is-fixed-price ("Est. budget: $80.00").
+        // Combine the two (NOT raw_text — that would catch "$70K+ spent").
+        const jobType = el.querySelector('[data-test="job-type-label"]')?.textContent?.trim() || '';
+        const fixedAmt = el.querySelector('[data-test="is-fixed-price"]')?.textContent?.trim() || '';
+        const budgetText = [jobType, fixedAmt].filter(Boolean).join(' ');
         const hints = extractCardHints(el);
         return {
           title: titleA?.textContent?.trim(),
           url: titleA?.href,
           description: el.querySelector('[data-test="JobDescription"], [data-test="Description"], p')?.textContent?.trim()?.substring(0, 3000),
-          budget: el.querySelector('[data-test="job-type-label"]')?.textContent?.trim(),
+          budget: budgetText,
           country,
           skills: Array.from(el.querySelectorAll('[data-test="token"], .air3-token')).map(s => s.textContent.trim()).filter(Boolean).slice(0, 20),
           raw_text: el.textContent?.trim()?.substring(0, 5000),
