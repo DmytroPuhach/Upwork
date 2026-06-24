@@ -1,3 +1,5 @@
+// extension-job-enrich v8 — calls leadgen-v2 mode:"score_route" (was sync full pipeline);
+//     covers are now generated later via mode:"generate_cover" after human approval.
 // extension-job-enrich v7 — SECURITY: /outbound now authenticates caller via machine_id in
 //     extension_status (anon key is public); account taken from machine, body.account_slug ignored for auth.
 // extension-job-enrich v6 — STEP 0: secrets to Deno.env; + /outbound route (extension no longer holds service_role).
@@ -171,24 +173,25 @@ async function handleEnrich(req: Request): Promise<Response> {
     screening_questions: updatePayload.screening_questions || [],
   };
 
-  // v3: sync call to leadgen-v2 so extension gets bidding_accounts for tab management
+  // v37: score+route only (covers are generated later, after a human approves in the panel).
+  // We still call synchronously so the extension learns which accounts fit (tab management).
   let biddingAccounts: string[] = [];
   try {
     const lgResp = await fetch(`${SB_URL}/functions/v1/leadgen-v2`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SB_KEY}` },
       body: JSON.stringify({
-        account_slug,
+        mode: 'score_route',
+        watch_account_slug: account_slug,
         job: pipelineJob,
         matched_skills: Number(matched_skills) || 0,
         total_skills: Number(total_skills) || 0,
-        sync: true,
       }),
       signal: AbortSignal.timeout(90000),
     });
     if (lgResp.ok) {
       const lgData = await lgResp.json().catch(() => ({}));
-      biddingAccounts = Array.isArray(lgData.accounts_processed) ? lgData.accounts_processed : [];
+      biddingAccounts = Array.isArray(lgData.account_fit) ? lgData.account_fit.map((f: any) => f.account_slug).filter(Boolean) : [];
     }
   } catch (_e) {
     // timeout or network — extension keeps tab open (safe default)

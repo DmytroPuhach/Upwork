@@ -1,19 +1,19 @@
-// leadgen-v2 v36 — STEP 0: secrets moved to Deno.env (SB_SERVICE_ROLE, ANTHROPIC_API_KEY, TG_*),
-//                  bidding source-of-truth = team_members.is_bidding_enabled (not accounts.bidding_enabled)
-// leadgen-v2 v35 — city→country normalization in isCountryBlocked (Lahore→Pakistan etc + strip time suffix)
-// leadgen-v2 v34 — fix extra_qa: q.question/q.answer field names + filter empty items
-// leadgen-v2 v33 — match_score fallback fix (score ?? match_score), cover prompt fix
-// v23: v3 multi-account routing
-// v21: TG format — removed Почему подходит + Риски (dashboard-only fields).
-//      Cleaner layout: header line + client line + cover only.
-// Input: same as v19 { job, account_slug, matched_skills, total_skills, ingest_only, prematch_reason, sync }
-// Changes vs v19:
-//   - matchScoreAndCoversV3() replaces matchScore() + generateCover()
-//   - Single Claude call → tg_blocks[] (one cover per selected account)
-//   - Uses bid_decision_prompt_v3 + knowledge_base_v3 from opus_knowledge
-//   - Multi-account: one job → Dima + David + Vika covers in one request
-//   - New TG format: Freelancer, Priority, Score, Client, Why, Risks, Cover
-//   - TG bot: tg_brain for Dima, tg_agents for David/Vika/Vasya
+// leadgen-v2 v37 — SPLIT score/route from cover generation (human-in-the-loop).
+//   Single Deno.serve, routed by body.mode:
+//     mode:"score_route"   → ONE Claude call (bid_decision_prompt_v3 + knowledge_base_v3, NO cover).
+//                            Scores job, routes to accounts, writes match_scores. Returns account_fit
+//                            to the operator panel. NO Telegram, NO proposals, NO covers.
+//     mode:"generate_cover"→ ONE Claude call (cover_generator_prompt_v3 + knowledge_base_v3) on FULL
+//                            job text for ONE approved account. Writes proposal + proposal_audit, then
+//                            sends Telegram (job URL + cover) to that account's owner.
+//     ingest_only          → unchanged (funnel ingest, no AI).
+//   v37 cleanup: removed jsonSchemaFirst/Last override hack; account_slug everywhere (no name/slug dual);
+//     mergeEnrichedFromDb now carries proposals_count + client_member_since; removed dead TG fields
+//     penalties/detected_client_site; auditProposal writes REAL has_unicode_bold.
+// --- history ---
+// v36 — STEP 0: secrets to Deno.env; bidding source-of-truth = team_members.is_bidding_enabled
+// v35 — city→country normalization in isCountryBlocked
+// v34 — extra_qa field-name fix; v33 — match_score fallback; v23 — v3 multi-account routing
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -35,6 +35,38 @@ const BID_DECISIONS = ['bid_high', 'bid_medium', 'bid_low'];
 
 const db = () => createClient(SB_URL, SB_KEY, { db: { schema: 'upwork' } });
 const esc = (t) => String(t || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const json = (obj: any, status = 200) =>
+  new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json' } });
+
+// Clean output schemas — one per endpoint, account_slug only (no name, no dual slug/name instruction).
+const SCORE_SCHEMA = `## OUTPUT — JSON ONLY
+Respond with ONE raw JSON object and nothing else (no markdown, no prose, no code fences).
+Ignore any "Telegram informing"/text-format instructions in the knowledge base — this endpoint scores only.
+Schema:
+{
+  "decision": "bid_high" | "bid_medium" | "bid_low" | "skip",
+  "match_score": <integer 0-100>,
+  "reasoning": "<1-2 sentences>",
+  "stop_reason": "<string if decision=skip, else null>",
+  "breakdown": { "niche": <int>, "stack": <int>, "client": <int>, "pain": <int>, "dach": <int>, "market": <int> },
+  "detected_tech_stack": ["<lowercase tech>", ...],
+  "account_fit": [ { "account_slug": "<slug from Active Accounts>", "fit_score": <integer 0-100>, "why_account": "<1 sentence>", "risks": "<short string>" } ]
+}
+Rules:
+- Use account_slug values EXACTLY as given in Active Accounts. Never invent slugs.
+- account_fit: ONLY accounts that should bid, sorted by fit_score DESC. decision=skip → account_fit=[].
+- match_score = overall job quality (0-100); fit_score = per-account suitability.
+- Start with { and end with } — raw JSON only.`;
+
+const COVER_SCHEMA = `## OUTPUT — JSON ONLY
+Respond with ONE raw JSON object and nothing else (no markdown, no prose, no code fences).
+Schema:
+{
+  "cover": "<complete proposal, 80-150 words, ready to submit — never null/empty/placeholder>",
+  "extra_qa": "<answers to the screening questions as a short text block, or empty string if none>",
+  "risks": "<1-2 short risks for this specific bid, or empty string>"
+}
+Start with { and end with } — raw JSON only.`;
 
 async function dbg(sb, stage, payload) {
   try { await sb.from('leadgen_debug').insert({ stage, payload }); } catch {}
@@ -107,7 +139,7 @@ async function mergeEnrichedFromDb(sb, job, jobId) {
     'description, budget_type, budget_min, budget_max, client_country, client_rating, ' +
     'client_hires, client_spent_total, client_total_hours, client_hire_rate, ' +
     'client_avg_hourly_paid, skills, screening_questions, is_enriched, enriched_at, posted_at, ' +
-    'hours_per_week, project_length, experience_level'
+    'hours_per_week, project_length, experience_level, proposals_count, client_member_since'
   ).eq('id', jobId).maybeSingle();
   if (!row) return correctBudgetIfMisclassified(job);
   const merged = { ...job };
@@ -129,6 +161,9 @@ async function mergeEnrichedFromDb(sb, job, jobId) {
   if (!merged.hours_per_week && row.hours_per_week) merged.hours_per_week = row.hours_per_week;
   if (!merged.project_length && row.project_length) merged.project_length = row.project_length;
   if (!merged.experience_level && row.experience_level) merged.experience_level = row.experience_level;
+  // v37: these two were dropped before — they materially affect scoring (competition + client tenure)
+  if (merged.proposals_count == null && row.proposals_count != null) merged.proposals_count = row.proposals_count;
+  if (!merged.client_member_since && row.client_member_since) merged.client_member_since = row.client_member_since;
   merged._is_enriched = !!row.is_enriched;
   merged._posted_at = row.posted_at || null;
   return correctBudgetIfMisclassified(merged);
@@ -241,76 +276,48 @@ function auditProposal(text) {
   return { quality_score: qualityScore, issues, should_regenerate: qualityScore < 60 || words === 0 };
 }
 
-// V3: Single Claude call scores job + routes accounts + generates covers for all
-async function matchScoreAndCoversV3(job, enabledAccounts, sb) {
-  const { data: rows } = await sb.from('opus_knowledge').select('key, content')
-    .in('key', ['bid_decision_prompt_v3', 'knowledge_base_v3', 'cover_generator_prompt_v3']);
-  const decisionPrompt = rows?.find(r => r.key === 'bid_decision_prompt_v3')?.content;
-  const coverPrompt = rows?.find(r => r.key === 'cover_generator_prompt_v3')?.content;
-  const knowledgeBase = rows?.find(r => r.key === 'knowledge_base_v3')?.content;
-  if (!decisionPrompt) return { error: 'bid_decision_prompt_v3 not found' };
-  // v23: JSON schema FIRST in system prompt so Claude sees format requirement before old logic.
-  // The old bid_decision_prompt_v3 has a "Telegram informing" section describing a text format —
-  // explicitly override it at the top and bottom so Claude uses JSON output.
-  const jsonSchemaFirst = `## CRITICAL: JSON-ONLY OUTPUT — READ THIS BEFORE ANYTHING ELSE
-You are a JSON-only response generator for this request.
-Output ONLY a raw JSON object. No markdown. No code blocks. No text before { or after }.
-
-The prompt below may describe a "Telegram informing" text format — this is DEPRECATED and OBSOLETE.
-COMPLETELY IGNORE the Telegram text format. You MUST output JSON only.
-
-## REQUIRED JSON SCHEMA:
-{
-  "decision": "bid_high" | "bid_medium" | "bid_low" | "skip",
-  "match_score": <integer 0-100, REQUIRED — never null>,
-  "reasoning": "<1-2 sentences explaining the score>",
-  "stop_reason": "<reason if skip, else null>",
-  "breakdown": {
-    "niche": <integer, points for niche fit>,
-    "stack": <integer, points for tech stack>,
-    "client": <integer, points for client quality>,
-    "pain": <integer, points for clear pain>,
-    "dach": <integer, DACH market bonus>,
-    "market": <integer, other market bonus>
-  },
-  "detected_tech_stack": ["shopify", "ga4", ...],
-  "tg_blocks": [
-    {
-      "account": "<slug from Active Accounts list — use the slug field, not name>",
-      "priority": "BID HIGH" | "BID MEDIUM" | "BID LOW",
-      "why_account": "<1 sentence: why this specific account fits>",
-      "cover": "<COMPLETE PROPOSAL TEXT — 80 to 150 words, ready to submit to client. MANDATORY. Must not be null, empty, or a placeholder>",
-      "risks": ["<risk 1>", "<risk 2>"],
-      "extra_qa": [{"question": "<screening question text>", "answer": "<ready answer>"}]
-    }
-  ]
+// One Anthropic call, returns parsed JSON object or { error }.
+async function callClaude(system: string, userMsg: string, sb: any, tag: string, maxTokens = 3500) {
+  await dbg(sb, `${tag}_call_start`, { system_chars: system.length, user_chars: userMsg.length });
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': AK, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: maxTokens,
+        system,
+        messages: [{ role: 'user', content: userMsg }],
+      }),
+      signal: AbortSignal.timeout(85000),
+    });
+    const bodyText = await res.text();
+    await dbg(sb, `${tag}_call_resp`, { status: res.status, body_chars: bodyText.length, body: res.ok ? undefined : bodyText.substring(0, 500) });
+    if (!res.ok) return { error: `Claude HTTP ${res.status}` };
+    let data;
+    try { data = JSON.parse(bodyText); } catch { return { error: 'JSON parse fail on Claude response' }; }
+    const rawText = data.content?.[0]?.text || '';
+    const m = rawText.match(/\{[\s\S]*\}/);
+    if (!m) return { error: 'No JSON block in Claude output' };
+    const cleaned = m[0].replace(/:\s*\+(\d)/g, ': $1');
+    try { return JSON.parse(cleaned); } catch { return { error: 'JSON parse fail on extracted block' }; }
+  } catch (e) {
+    await dbg(sb, `${tag}_exception`, { err: String(e?.message || e) });
+    return { error: String(e?.message || e) };
+  }
 }
 
-MANDATORY RULES:
-- Start your response with { — nothing before it
-- End your response with } — nothing after it
-- "match_score" must be an integer (0-100), never null
-- decision=skip → tg_blocks=[] (still include match_score and reasoning)
-- Each bidding account gets its own tg_block with a UNIQUE cover letter
-- "cover" MUST be a complete, personalized proposal (80-150 words). NOT null. NOT "". NOT a placeholder.
+// ENDPOINT A helper: score + route (NO cover). system = bid_decision_prompt_v3 + knowledge_base_v3.
+async function scoreRouteClaude(job, enabledAccounts, sb) {
+  const { data: rows } = await sb.from('opus_knowledge').select('key, content')
+    .in('key', ['bid_decision_prompt_v3', 'knowledge_base_v3']);
+  const decisionPrompt = rows?.find(r => r.key === 'bid_decision_prompt_v3')?.content;
+  const knowledgeBase = rows?.find(r => r.key === 'knowledge_base_v3')?.content;
+  if (!decisionPrompt) return { error: 'bid_decision_prompt_v3 not found' };
 
----
-
-`;
-
-  const jsonSchemaLast = `
-
----
-
-## FINAL REMINDER: Output format
-- Start with { end with } — raw JSON only, no markdown
-- Every tg_block "cover" field MUST contain a complete proposal (80-150 words)
-- "match_score" must be an integer, never null`;
-
-  const systemPrompt = jsonSchemaFirst
-    + decisionPrompt
-    + (coverPrompt ? `\n\n---\n\n## COVER LETTER WRITING RULES (apply when writing each "cover" field in tg_blocks):\n\n${coverPrompt}` : '')
-    + jsonSchemaLast;
+  const system = decisionPrompt
+    + (knowledgeBase ? `\n\n---\n\n## AGENCY KNOWLEDGE BASE\n${knowledgeBase.substring(0, 7000)}` : '')
+    + `\n\n---\n\n${SCORE_SCHEMA}`;
 
   const desc = (job._cleaned_description || job.description || '').substring(0, 3500);
   const matchedSk = Number(job._matched_skills) || 0;
@@ -323,9 +330,9 @@ MANDATORY RULES:
   const hireRate = job.client_hire_rate != null ? `${Math.round(Number(job.client_hire_rate) * 100)}%` : 'unknown';
   const ageMin = computeJobAgeMin(job);
 
+  // account_slug only — no name field anywhere.
   const accountProfiles = enabledAccounts.map(a => ({
-    slug: a.slug,
-    name: a.name,
+    account_slug: a.slug,
     specialization: (a.specialization || []).slice(0, 8),
     hourly_rate: a.hourly_rate,
     jss: a.jss_current,
@@ -359,118 +366,75 @@ ${desc}
 ## Screening Questions
 ${JSON.stringify(job.screening_questions || [])}
 
-## Active Accounts (route only to these)
-${JSON.stringify(accountProfiles, null, 2)}
+## Active Accounts (route only to these account_slug values)
+${JSON.stringify(accountProfiles, null, 2)}`;
 
-${knowledgeBase ? `## Agency Knowledge Base\n${knowledgeBase.substring(0, 7000)}` : ''}
-
-## REQUIRED JSON OUTPUT FORMAT
-Return ONLY a raw JSON object (no markdown, no code blocks). Exact schema:
-{
-  "decision": "bid_high" | "bid_medium" | "bid_low" | "skip",
-  "match_score": <integer 0-100>,
-  "reasoning": "<1-2 sentence explanation>",
-  "stop_reason": "<reason if skip, else null>",
-  "breakdown": {
-    "niche": <0 or positive integer, points for niche fit>,
-    "stack": <0 or positive integer, points for tech stack>,
-    "client": <0 or positive integer, points for client quality>,
-    "pain": <0 or positive integer, points for clear pain/problem>,
-    "dach": <0 or positive integer, DACH market bonus>,
-    "market": <0 or positive integer, other strong market bonus>
-  },
-  "detected_tech_stack": ["shopify", "ga4", ...],
-  "tg_blocks": [
-    {
-      "account": "<name field from Active Accounts — use name, not slug>",
-      "priority": "BID HIGH" | "BID MEDIUM" | "BID LOW",
-      "why_account": "<1 sentence: why this specific account>",
-      "cover": "<full proposal text, 80-150 words, unique per account>",
-      "risks": ["<risk 1>", "<risk 2>"],
-      "extra_qa": [{"question": "<screening Q>", "answer": "<ready answer>"}]
-    }
-  ]
-}
-Rules: decision=skip → tg_blocks=[]. Each bidding account gets its own tg_block with unique cover. Cover must be a complete proposal ready to send.`;
-
-  await dbg(sb, 'v3_call_start', { system_chars: systemPrompt.length, user_chars: userMsg.length, accounts: enabledAccounts.map(a => a.slug) });
-
-  try {
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': AK, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 8000,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: userMsg }]
-      }),
-      signal: AbortSignal.timeout(85000)
-    });
-    const bodyText = await res.text();
-    await dbg(sb, 'v3_call_resp', { status: res.status, body_chars: bodyText.length });
-    if (!res.ok) return { error: `Claude HTTP ${res.status}` };
-    let data;
-    try { data = JSON.parse(bodyText); } catch { return { error: 'JSON parse fail on Claude response' }; }
-    const rawText = data.content?.[0]?.text || '';
-    await dbg(sb, 'v3_extracted', { preview: rawText.substring(0, 300) });
-    const m = rawText.match(/\{[\s\S]*\}/);
-    if (!m) return { error: 'No JSON block in Claude output' };
-    const cleaned = m[0].replace(/:\s*\+(\d)/g, ': $1');
-    return JSON.parse(cleaned);
-  } catch (e) {
-    await dbg(sb, 'v3_exception', { err: String(e?.message || e) });
-    return { error: String(e?.message || e) };
-  }
+  return await callClaude(system, userMsg, sb, 'score', 2500);
 }
 
-async function sendTgV3(account, block, job, decision, ageMin, proposalId) {
+// ENDPOINT B helper: generate ONE cover on full job text. system = cover_generator_prompt_v3 + knowledge_base_v3.
+async function generateCoverClaude(fullText, account, job, sb) {
+  const { data: rows } = await sb.from('opus_knowledge').select('key, content')
+    .in('key', ['cover_generator_prompt_v3', 'knowledge_base_v3']);
+  const coverPrompt = rows?.find(r => r.key === 'cover_generator_prompt_v3')?.content;
+  const knowledgeBase = rows?.find(r => r.key === 'knowledge_base_v3')?.content;
+  if (!coverPrompt) return { error: 'cover_generator_prompt_v3 not found' };
+
+  const system = coverPrompt
+    + (knowledgeBase ? `\n\n---\n\n## AGENCY KNOWLEDGE BASE\n${knowledgeBase.substring(0, 7000)}` : '')
+    + `\n\n---\n\n${COVER_SCHEMA}`;
+
+  const profile = {
+    account_slug: account.slug,
+    specialization: (account.specialization || []).slice(0, 10),
+    hourly_rate: account.hourly_rate,
+    jss: account.jss_current,
+    proposal_style: account.proposal_style,
+    bio: (account.bio || '').substring(0, 600),
+    cases: (account.cases || []).slice(0, 4),
+    cv: (account.cv_text || '').substring(0, 1500),
+  };
+
+  const userMsg = `## Job (full text)
+${(fullText || '').substring(0, 6000)}
+
+## Screening Questions
+${JSON.stringify(job.screening_questions || [])}
+
+## Write the proposal AS this account
+${JSON.stringify(profile, null, 2)}`;
+
+  return await callClaude(system, userMsg, sb, 'cover', 2000);
+}
+
+// ENDPOINT B: Telegram to the owner of account_slug — clean (job URL + cover). No penalties/detected_client_site.
+async function sendCoverTg(account, job, cover, extraQa, proposalId) {
+  // bot: account override → team_members mapping (dima → brain) → agents default
   const botToken = account.telegram_bot_token || (account.slug === 'dima' ? TG_BRAIN : TG_AGENTS);
   const chatId = account.telegram_chat_id || CHAT;
   const accName = account.name || account.slug;
+  const jobUrl = job.upwork_url || job.url || '';
 
-  const br = decision.breakdown || {};
-  const brkStr = `niche:${br.niche ?? 0} stack:${br.stack ?? 0} dach:${br.dach ?? 0} pain:${br.pain ?? 0} penalties:${br.penalties ?? 0}`;
+  let msg = `🔥 <b>Upwork Lead</b> — <b>${esc(accName)}</b>\n\n`;
+  msg += `<b>${esc(job.title || '')}</b>\n`;
+  if (jobUrl) msg += `${esc(jobUrl)}\n`;
+  msg += `\n<b>Cover:</b>\n<pre>${esc((cover || '').substring(0, 2800))}</pre>`;
+  if (extraQa && String(extraQa).trim()) {
+    msg += `\n\n❓ <b>Screening:</b>\n${esc(String(extraQa).substring(0, 800))}`;
+  }
 
-  const ageStr = ageMin != null
-    ? (ageMin <= 15 ? `⚡ ${ageMin} min ago` : ageMin <= 30 ? `⏳ ${ageMin} min ago` : `🔴 ${ageMin} min ago`)
-    : 'unknown';
-
-  const siteStr = decision.detected_client_site ? ` | <code>${esc(decision.detected_client_site)}</code>` : '';
-  const techStr = decision.detected_tech_stack?.length ? ` | ${esc(decision.detected_tech_stack.slice(0, 3).join(', '))}` : '';
-
-  const validQa = (block.extra_qa || []).filter(q => (q.question || q.q) && (q.answer || q.a));
-  const qaBlock = validQa.length > 0
-    ? '\n\n❓ <b>Доп. вопросы:</b>\n' + validQa.map(q => `<b>Q:</b> ${esc(q.question || q.q)}\n<i>A:</i> ${esc(q.answer || q.a)}`).join('\n\n')
-    : '';
-
-  // v21: compact layout — why_fits + risks moved to dashboard only
-  let msg = `🔥 <b>Upwork Lead</b>\n\n`;
-  msg += `<b>${esc(accName)}</b> | ${esc(block.priority)} | ${decision.match_score ?? decision.score ?? '?'}/100\n`;
-  msg += `<i>${brkStr}</i>\n\n`;
-  msg += `<b>${esc(job.title)}</b>\n`;
-  msg += `<i>${esc(block.why_account)}</i>\n\n`;
-  msg += `${esc(job.client_country || 'unknown')}${siteStr}${techStr} | `;
-  msg += `$${job.client_spent_total || 0} spent | ${ageStr}\n\n`;
-  msg += `<b>Письмо:</b>\n<pre>${esc((block.cover || '').substring(0, 2800))}</pre>`;
-  msg += qaBlock;
-
-  const buttons = [];
+  const buttons: any[] = [];
   if (proposalId) {
     buttons.push([
       { text: '✅ Approve', callback_data: `bid_approve:${proposalId}` },
-      { text: '❌ Decline', callback_data: `bid_decline:${proposalId}` }
+      { text: '❌ Decline', callback_data: `bid_decline:${proposalId}` },
     ]);
-    buttons.push([
-      { text: '💬 Comment', callback_data: `bid_comment:${proposalId}` },
-      { text: '📋 Submitted', callback_data: `bid_submitted:${proposalId}` }
-    ]);
+    buttons.push([{ text: '📋 Submitted', callback_data: `bid_submitted:${proposalId}` }]);
   }
-  const jobUrl = job.upwork_url || job.url;
   if (jobUrl) buttons.push([{ text: '🔗 Open job', url: jobUrl }]);
 
   try {
-    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+    const r = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -478,11 +442,13 @@ async function sendTgV3(account, block, job, decision, ageMin, proposalId) {
         text: msg.substring(0, 4000),
         parse_mode: 'HTML',
         disable_web_page_preview: true,
-        reply_markup: buttons.length > 0 ? { inline_keyboard: buttons } : undefined
-      })
+        reply_markup: buttons.length > 0 ? { inline_keyboard: buttons } : undefined,
+      }),
     });
+    return r.ok;
   } catch (e) {
     console.error('[leadgen-v2] TG send failed:', e);
+    return false;
   }
 }
 
@@ -519,217 +485,211 @@ async function runIngestOnly(job, account, opts: any = {}) {
   }
 }
 
-async function runPipelineV3(job, primaryAccount, test_mode, opts: any = {}): Promise<string[]> {
+// ENDPOINT A — score + route. NO covers, NO Telegram, NO proposals.
+// Returns { ok, job_id, decision, match_score, breakdown, account_fit } for the operator panel.
+async function runScoreRoute(job, watchAccount, opts: any = {}) {
   const sb = db();
   const runId = crypto.randomUUID();
   try {
-    await dbg(sb, 'pipeline_start_v3', { run_id: runId, title: job.title, primary_account: primaryAccount.slug });
+    await dbg(sb, 'score_route_start', { run_id: runId, title: job.title, watch_account: watchAccount.slug });
 
-    // 1. Upsert job using primary account (machine that scraped it)
-    const jobId = await upsertJob(sb, job, primaryAccount);
-    if (jobId) {
-      job.id = jobId;
-      job = await mergeEnrichedFromDb(sb, job, jobId);
-    } else {
-      job = await mergeEnrichedFromDb(sb, job, null);
-    }
+    // PRE-CLAUDE (in order): correctBudget, upsertJob, mergeEnrichedFromDb, cleanDescription
+    job = correctBudgetIfMisclassified(job);
+    const jobId = await upsertJob(sb, job, watchAccount);
+    job = await mergeEnrichedFromDb(sb, job, jobId);
     job._matched_skills = Number(opts.matched_skills) || 0;
     job._total_skills = Number(opts.total_skills) || 0;
-
     const { cleaned } = cleanDescription(job.description || '');
     job._cleaned_description = cleaned;
     const ageMin = computeJobAgeMin(job);
 
-    // 2. Agency check (global skip — no point bidding for any account)
+    const skipResult = (stop_reason: string) => ({
+      ok: true, job_id: jobId, decision: 'skip', match_score: 0,
+      breakdown: null, account_fit: [], stop_reason,
+    });
+
+    // Agency skip
     if (isAgencyJob(job)) {
-      await dbg(sb, 'early_stop_agency', { run_id: runId });
-      if (jobId) {
-        await sb.from('match_scores').insert({
-          job_id: jobId, account_slug: primaryAccount.slug,
-          total_score: 0, decision: 'skip', detected_stop_reason: 'agency',
-          should_bid: false, reasoning: 'Agency/white-label job detected',
-        });
-      }
-      return [];
+      if (jobId) await sb.from('match_scores').insert({
+        job_id: jobId, account_slug: watchAccount.slug, total_score: 0,
+        decision: 'skip', detected_stop_reason: 'agency', should_bid: false,
+        reasoning: 'Agency/white-label job detected',
+      });
+      await dbg(sb, 'score_route_skip', { run_id: runId, reason: 'agency' });
+      return skipResult('agency');
     }
 
-    // 3. Load accounts whose team_member has bidding enabled (single source of truth:
-    //    team_members.is_bidding_enabled), then filter by country.
+    // Active accounts: team_members.is_bidding_enabled (single source of truth) → accounts → country filter
     const { data: biddingMembers } = await sb.from('team_members')
-      .select('account_id')
-      .eq('is_bidding_enabled', true)
-      .eq('is_active', true);
-    const biddingAccountIds = (biddingMembers || [])
-      .map(m => m.account_id)
-      .filter(Boolean);
-
+      .select('account_id').eq('is_bidding_enabled', true).eq('is_active', true);
+    const biddingAccountIds = (biddingMembers || []).map(m => m.account_id).filter(Boolean);
     if (biddingAccountIds.length === 0) {
       await dbg(sb, 'no_bidding_accounts', { run_id: runId });
-      return [];
+      return skipResult('no_bidding_accounts');
     }
-
     const { data: allAccounts } = await sb.from('accounts')
       .select('id, slug, name, bio, cases, cv_text, specialization, hourly_rate, jss_current, telegram_bot_token, telegram_chat_id, blocked_countries, status')
-      .in('id', biddingAccountIds)
-      .eq('status', 'active');
-
-    const enabledAccounts = (allAccounts || []).filter(a =>
-      !isCountryBlocked(job.client_country, a.blocked_countries)
-    );
-
+      .in('id', biddingAccountIds).eq('status', 'active');
+    const enabledAccounts = (allAccounts || []).filter(a => !isCountryBlocked(job.client_country, a.blocked_countries));
     if (enabledAccounts.length === 0) {
       await dbg(sb, 'all_accounts_blocked', { run_id: runId, country: job.client_country });
-      return [];
+      return skipResult('all_accounts_blocked');
     }
 
-    // 4. Dedup: if another machine already scored this job, skip
+    // Dedup: already scored?
     if (jobId) {
       const { data: alreadyScored } = await sb.from('match_scores').select('id').eq('job_id', jobId).limit(1).maybeSingle();
       if (alreadyScored) {
         await dbg(sb, 'dedup_skip', { run_id: runId, job_id: jobId });
-        return [];
+        return skipResult('already_scored');
       }
     }
 
-    // 5. Server pre-filter: proposals ≥ 10 AND age > 30 min
+    // Server pre-filter: proposals ≥ 10 AND age > 30 min
     if (job.proposals_count != null && job.proposals_count >= 10 && ageMin != null && ageMin > 30) {
       await dbg(sb, 'server_prefilter', { run_id: runId, proposals: job.proposals_count, age_min: ageMin });
-      return [];
+      return skipResult('too_competitive_old');
     }
 
-    // 5. Single v3 Claude call — score + route + generate covers for all accounts
-    const decision = await matchScoreAndCoversV3(job, enabledAccounts, sb);
-    const matchScore = decision.match_score ?? decision.score ?? null;
-    const reasoning = decision.reasoning ?? decision.reason ?? null;
-    await dbg(sb, 'v3_decision', { run_id: runId, decision: decision.decision, score: matchScore, accounts: decision.accounts, error: decision.error });
-
-    if (decision.error) {
-      console.error('[leadgen-v2 v3] Claude error:', decision.error);
-      return [];
+    // CLAUDE — score + route only
+    const result = await scoreRouteClaude(job, enabledAccounts, sb);
+    if (result.error) {
+      await dbg(sb, 'score_route_claude_error', { run_id: runId, err: result.error });
+      return { ok: false, job_id: jobId, error: result.error };
     }
+    const decision = (result.decision || '').toLowerCase().replace(/[\s-]+/g, '_');
+    const matchScore = result.match_score ?? null;
+    const breakdown = result.breakdown || {};
+    const reasoning = result.reasoning || null;
+    const accountFitRaw = Array.isArray(result.account_fit) ? result.account_fit : [];
+    await dbg(sb, 'score_route_decision', { run_id: runId, decision, match_score: matchScore, fit: accountFitRaw.map(a => a.account_slug) });
 
-    // 6. Handle skip/stop globally
-    const normalizedDecision = (decision.decision || '').toLowerCase().replace(/[\s-]+/g, '_');
-    decision.decision = normalizedDecision;
-    if (!BID_DECISIONS.includes(normalizedDecision)) {
-      if (jobId) {
-        for (const acc of enabledAccounts) {
-          const { data: ex } = await sb.from('match_scores').select('id').eq('job_id', jobId).eq('account_slug', acc.slug).maybeSingle();
-          if (!ex) {
-            await sb.from('match_scores').insert({
-              job_id: jobId, account_slug: acc.slug,
-              total_score: matchScore ?? 0,
-              decision: 'skip', should_bid: false,
-              reasoning: reasoning,
-              detected_stop_reason: decision.stop_reason || decision.decision,
-            });
-          }
-        }
-      }
-      return [];
-    }
-
-    // 7. Process each tg_block
-    for (const block of (decision.tg_blocks || [])) {
-      const blockAccNorm = (block.account || '').toLowerCase().trim();
-      const acc = enabledAccounts.find(a =>
-        a.slug === blockAccNorm ||
-        (a.name || '').toLowerCase() === blockAccNorm
-      );
-      if (!acc) {
-        await dbg(sb, 'v3_account_not_found', { run_id: runId, slug: block.account, normalized: blockAccNorm });
-        continue;
-      }
-
-      // Save match_score
-      let scoreId = null;
-      if (jobId) {
+    // WRITES — match_scores per account
+    const isBid = BID_DECISIONS.includes(decision);
+    const validFit: any[] = [];
+    if (!jobId) {
+      // can't persist without a job row; still return decision to panel
+    } else if (!isBid || accountFitRaw.length === 0) {
+      // skip — one skip row per enabled account
+      for (const acc of enabledAccounts) {
         const { data: ex } = await sb.from('match_scores').select('id').eq('job_id', jobId).eq('account_slug', acc.slug).maybeSingle();
-        const br = decision.breakdown || {};
-        const scorePayload = {
+        if (!ex) await sb.from('match_scores').insert({
+          job_id: jobId, account_slug: acc.slug, total_score: matchScore ?? 0,
+          decision: 'skip', should_bid: false, reasoning,
+          detected_stop_reason: result.stop_reason || 'no_fit',
+        });
+      }
+    } else {
+      for (const fit of accountFitRaw) {
+        const slug = (fit.account_slug || '').toLowerCase().trim();
+        const acc = enabledAccounts.find(a => a.slug === slug);
+        if (!acc) { await dbg(sb, 'score_route_acct_not_found', { run_id: runId, slug: fit.account_slug }); continue; }
+        const payload = {
           job_id: jobId, account_slug: acc.slug,
-          total_score: matchScore,
-          niche_fit: br.niche ?? null,
-          stack_fit: br.stack ?? null,
-          client_tier: br.client ?? null,
-          brief_quality: br.pain ?? null,
-          red_flags: block.risks?.length ? block.risks.length * -5 : 0,
-          bonus_signals: br.dach ?? br.market ?? null,
-          reasoning: reasoning,
-          decision: decision.decision,
-          should_bid: true,
+          total_score: fit.fit_score ?? matchScore ?? 0,
+          niche_fit: breakdown.niche ?? null,
+          stack_fit: breakdown.stack ?? null,
+          client_tier: breakdown.client ?? null,
+          brief_quality: breakdown.pain ?? null,
+          bonus_signals: ((breakdown.dach ?? 0) + (breakdown.market ?? 0)) || null,
+          reasoning: fit.why_account ? `${reasoning || ''} | ${fit.why_account}`.trim() : reasoning,
+          decision, should_bid: true,
           matched_skills: job._matched_skills || null,
           total_skills: job._total_skills || null,
         };
-        if (ex) {
-          await sb.from('match_scores').update(scorePayload).eq('id', ex.id);
-          scoreId = ex.id;
-        } else {
-          const { data: ins } = await sb.from('match_scores').insert(scorePayload).select('id').maybeSingle();
-          scoreId = ins?.id || null;
-        }
+        const { data: ex } = await sb.from('match_scores').select('id').eq('job_id', jobId).eq('account_slug', acc.slug).maybeSingle();
+        if (ex) await sb.from('match_scores').update(payload).eq('id', ex.id);
+        else await sb.from('match_scores').insert(payload);
+        validFit.push({ account_slug: acc.slug, fit_score: fit.fit_score ?? null, why_account: fit.why_account || '', risks: fit.risks || '' });
       }
-
-      // Audit cover
-      const audit = auditProposal(block.cover || '');
-
-      // Save proposal
-      let proposalId = null;
-      if (jobId && block.cover && block.cover.length > 50) {
-        const { data: exP } = await sb.from('proposals').select('id').eq('job_id', jobId).eq('member_slug', acc.slug).maybeSingle();
-        if (!exP) {
-          const propPayload = {
-            job_id: jobId,
-            account_id: acc.id,
-            member_slug: acc.slug,
-            proposal_text: block.cover,
-            match_score: matchScore,
-            status: 'generated',
-            generator_version: 'v3',
-            language: 'EN',
-            tools_used: {
-              v3: true,
-              accounts_evaluated: enabledAccounts.map(a => a.slug),
-              tech_stack: decision.detected_tech_stack || [],
-              screening_qa: block.extra_qa || [],
-            },
-          };
-          const { data: saved } = await sb.from('proposals').insert(propPayload).select('id').maybeSingle();
-          proposalId = saved?.id || null;
-
-          if (proposalId) {
-            try {
-              await sb.from('proposal_audit').insert({
-                proposal_id: proposalId,
-                has_unicode_bold: false,
-                has_preamble: audit.issues.includes('Preamble leaked'),
-                has_overused_hook: audit.issues.includes('Overused Quick question hook'),
-                has_fake_stats: audit.issues.includes('Fake stats'),
-                has_irrelevant_case: false,
-                quality_score: audit.quality_score,
-                issues: audit.issues,
-                should_regenerate: audit.should_regenerate,
-              });
-            } catch {}
-          }
-        }
-      }
-
-      // Send TG
-      await sendTgV3(acc, block, job, decision, ageMin, proposalId);
-      await dbg(sb, 'v3_block_done', { run_id: runId, account: acc.slug, proposal_id: proposalId, quality: audit.quality_score });
     }
 
-    const accountsProcessed = (decision.tg_blocks || []).map(b => {
-      const norm = (b.account || '').toLowerCase().trim();
-      const matched = enabledAccounts.find(a => a.slug === norm || (a.name || '').toLowerCase() === norm);
-      return matched ? matched.slug : null;
-    }).filter(Boolean) as string[];
-    await dbg(sb, 'pipeline_end_v3', { run_id: runId, accounts_processed: accountsProcessed });
-    return accountsProcessed;
+    await dbg(sb, 'score_route_end', { run_id: runId, decision, fit_count: validFit.length });
+    return {
+      ok: true, job_id: jobId, decision, match_score: matchScore,
+      breakdown, detected_tech_stack: result.detected_tech_stack || [],
+      account_fit: isBid ? validFit : [],
+    };
   } catch (err) {
-    await dbg(sb, 'pipeline_error_v3', { run_id: runId, err: String(err?.message || err) });
-    return [];
+    await dbg(sb, 'score_route_error', { run_id: runId, err: String(err?.message || err) });
+    return { ok: false, error: String(err?.message || err) };
+  }
+}
+
+// ENDPOINT B — generate ONE cover for an approved account on the FULL job text, then Telegram the owner.
+// Returns { ok, proposal_id, tg_sent }.
+async function runGenerateCover(jobId, accountSlug, fullText) {
+  const sb = db();
+  const runId = crypto.randomUUID();
+  try {
+    if (!jobId || !accountSlug) return { ok: false, error: 'need job_id + account_slug' };
+    const { data: job } = await sb.from('jobs').select('*').eq('id', jobId).maybeSingle();
+    if (!job) return { ok: false, error: 'job not found', job_id: jobId };
+    const account = await resolveAccount(sb, accountSlug);
+    if (!account) return { ok: false, error: 'account not found', account_slug: accountSlug };
+
+    await dbg(sb, 'cover_start', { run_id: runId, job_id: jobId, account: account.slug });
+
+    const text = (fullText && fullText.length > 50) ? fullText : (job.description || '');
+    const result = await generateCoverClaude(text, account, job, sb);
+    if (result.error) {
+      await dbg(sb, 'cover_claude_error', { run_id: runId, err: result.error, account: account.slug });
+      return { ok: false, error: result.error };
+    }
+    const cover = (result.cover || '').trim();
+    if (cover.length < 50) return { ok: false, error: 'cover too short / empty' };
+
+    const audit = auditProposal(cover);
+    const hasUnicodeBold = /[\u{1D400}-\u{1D7FF}]/u.test(cover); // REAL detection, not hardcoded
+
+    // match_score from match_scores (written in score_route)
+    let matchScore: any = null;
+    const { data: ms } = await sb.from('match_scores').select('total_score').eq('job_id', jobId).eq('account_slug', account.slug).maybeSingle();
+    if (ms) matchScore = ms.total_score;
+
+    // proposal row (reuse if exists for this job+account)
+    let proposalId: string | null = null;
+    const toolsUsed = { extra_qa: result.extra_qa || '', risks: result.risks || '', generator: 'v37' };
+    const { data: exP } = await sb.from('proposals').select('id').eq('job_id', jobId).eq('member_slug', account.slug).maybeSingle();
+    if (exP) {
+      await sb.from('proposals').update({
+        proposal_text: cover, match_score: matchScore, status: 'generated',
+        generator_version: 'v37', tools_used: toolsUsed,
+      }).eq('id', exP.id);
+      proposalId = exP.id;
+    } else {
+      const { data: saved } = await sb.from('proposals').insert({
+        job_id: jobId, account_id: account.id, member_slug: account.slug,
+        proposal_text: cover, match_score: matchScore, status: 'generated',
+        generator_version: 'v37', language: 'EN', tools_used: toolsUsed,
+      }).select('id').maybeSingle();
+      proposalId = saved?.id || null;
+    }
+
+    // proposal_audit with REAL has_unicode_bold
+    if (proposalId) {
+      try {
+        await sb.from('proposal_audit').insert({
+          proposal_id: proposalId,
+          has_unicode_bold: hasUnicodeBold,
+          has_preamble: audit.issues.includes('Preamble leaked'),
+          has_overused_hook: audit.issues.includes('Overused Quick question hook'),
+          has_fake_stats: audit.issues.includes('Fake stats'),
+          has_irrelevant_case: false,
+          quality_score: audit.quality_score,
+          issues: audit.issues,
+          should_regenerate: audit.should_regenerate,
+        });
+      } catch {}
+    }
+
+    // Telegram to the owner of this account
+    const tgSent = await sendCoverTg(account, job, cover, result.extra_qa, proposalId);
+    await dbg(sb, 'cover_done', { run_id: runId, account: account.slug, proposal_id: proposalId, quality: audit.quality_score, tg_sent: tgSent });
+    return { ok: true, proposal_id: proposalId, tg_sent: tgSent };
+  } catch (err) {
+    await dbg(sb, 'cover_error', { run_id: runId, err: String(err?.message || err) });
+    return { ok: false, error: String(err?.message || err) };
   }
 }
 
@@ -738,24 +698,46 @@ Deno.serve(async (req) => {
   const sb = db();
   try {
     const body = await req.json();
-    const { job, account_slug, test_mode, sync, ingest_only, prematch_reason, prematch_score, matched_skills, total_skills } = body;
-    if (!job || !account_slug) return new Response(JSON.stringify({ error: 'need job + account_slug' }), { status: 400 });
-    const account = await resolveAccount(sb, account_slug);
-    if (!account) {
-      await dbg(sb, 'account_resolve_fail', { account_slug });
-      return new Response(JSON.stringify({ error: 'account not found', tried: account_slug }), { status: 404 });
+    const mode = body.mode;
+
+    // ingest_only — unchanged funnel ingest (no AI). Kept as-is.
+    if (body.ingest_only) {
+      if (!body.job || !body.account_slug) return json({ error: 'need job + account_slug' }, 400);
+      const account = await resolveAccount(sb, body.account_slug);
+      if (!account) {
+        await dbg(sb, 'account_resolve_fail', { account_slug: body.account_slug });
+        return json({ error: 'account not found', tried: body.account_slug }, 404);
+      }
+      const r = await runIngestOnly(body.job, account, {
+        prematch_reason: body.prematch_reason, prematch_score: body.prematch_score,
+        matched_skills: body.matched_skills, total_skills: body.total_skills,
+      });
+      return json({ ...r, resolved_account: account.slug }, r.ok ? 200 : 500);
     }
-    if (ingest_only) {
-      const r = await runIngestOnly(job, account, { prematch_reason, prematch_score, matched_skills, total_skills });
-      return new Response(JSON.stringify({ ...r, resolved_account: account.slug }), { status: r.ok ? 200 : 500 });
+
+    // ENDPOINT A: score + route
+    if (mode === 'score_route') {
+      if (!body.job) return json({ error: 'need job' }, 400);
+      const watchSlug = body.watch_account_slug || body.account_slug;
+      if (!watchSlug) return json({ error: 'need watch_account_slug' }, 400);
+      const watchAccount = await resolveAccount(sb, watchSlug);
+      if (!watchAccount) {
+        await dbg(sb, 'account_resolve_fail', { account_slug: watchSlug });
+        return json({ error: 'watch account not found', tried: watchSlug }, 404);
+      }
+      const r = await runScoreRoute(body.job, watchAccount, { matched_skills: body.matched_skills, total_skills: body.total_skills });
+      return json(r, r.ok ? 200 : 500);
     }
-    if (sync) {
-      const accountsProcessed = await runPipelineV3(job, account, !!test_mode, { matched_skills, total_skills });
-      return new Response(JSON.stringify({ ok: true, mode: 'sync', resolved_account: account.slug, accounts_processed: accountsProcessed }));
+
+    // ENDPOINT B: generate cover for one approved account
+    if (mode === 'generate_cover') {
+      if (!body.job_id || !body.account_slug) return json({ error: 'need job_id + account_slug' }, 400);
+      const r = await runGenerateCover(body.job_id, body.account_slug, body.full_text || '');
+      return json(r, r.ok ? 200 : 500);
     }
-    EdgeRuntime.waitUntil(runPipelineV3(job, account, !!test_mode, { matched_skills, total_skills }));
-    return new Response(JSON.stringify({ ok: true, mode: 'async', status: 'queued', title: job.title, resolved_account: account.slug }));
+
+    return json({ error: 'unknown mode', expected: ['score_route', 'generate_cover'], note: 'funnel ingest via ingest_only:true' }, 400);
   } catch (err) {
-    return new Response(JSON.stringify({ error: String(err?.message || err) }), { status: 500 });
+    return json({ error: String(err?.message || err) }, 500);
   }
 });
