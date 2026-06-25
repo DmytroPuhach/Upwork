@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "OptimizeUp Metrics",
+  "version": "1.0.0",
+  "description": "Teammate-side metrics tool. Manual 'Scan' on Upwork stat pages only. NO feed monitoring, NO auto-refresh, NO background tabs.",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "https://www.upwork.com/nx/my-stats/*",
+    "https://www.upwork.com/nx/proposals/*",
+    "https://www.upwork.com/nx/plans/connects/history/*",
+    "https://www.upwork.com/ab/notifications/*",
+    "https://nsmcaexdqbipusjuzfht.supabase.co/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.upwork.com/nx/my-stats/*",
+        "https://www.upwork.com/nx/proposals/*",
+        "https://www.upwork.com/nx/plans/connects/history/*",
+        "https://www.upwork.com/ab/notifications/*"
+      ],
+      "js": ["scripts/metrics.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": { "16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png" }
+}

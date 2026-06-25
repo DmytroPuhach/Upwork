@@ -1,4 +1,6 @@
-// profile-sync v3
+// profile-sync v4
+// v4: fix my-stats 500 — accounts.jss_current write used .eq().catch() (invalid in supabase-js v2).
+//     Now await + try/catch. DEPLOY WITH --no-verify-jwt (extension posts without auth header).
 // v3: + /notifications route (DOM-scraped viewed/hired events from /ab/notifications/);
 //       + writes accounts.jss_current on my-stats sync.
 // v2: fixed alias resolver (team_members.account_id FK)
@@ -114,8 +116,9 @@ async function handleMyStats(body: any) {
   }
 
   // v3: also write accounts.jss_current for quick dashboard access
+  // (v4 fix: supabase-js v2 query builder has no .catch — await + try/catch instead)
   if (stats.jss !== null && stats.jss !== undefined) {
-    await sb().from('accounts').update({ jss_current: stats.jss }).eq('id', acc.id).catch(() => {});
+    try { await sb().from('accounts').update({ jss_current: stats.jss }).eq('id', acc.id); } catch {}
   }
 
   await logSync(acc.id, acc.slug, 'my_stats', 'success', 1, 1, null, null, Date.now() - t0, null);
