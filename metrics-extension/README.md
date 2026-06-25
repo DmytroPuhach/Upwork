@@ -51,6 +51,14 @@ verified to land a row before moving on (no blind writes). notifications updates
 machine_id) → profile-sync edge`. Account is resolved via `extension-config/identify`
 (machine_id + page uid) — read-only, no service_role.
 
+## Cadence + reminder (v1.4.0)
+Per-page freshness: my-stats 6h · proposals 2h · connects-history 24h · notifications 4h.
+- **Auto-scan-on-visit:** when the operator opens a stat page that is stale, it scans automatically.
+  It only ever runs the page the operator is already on — it NEVER opens tabs or runs in the
+  background (the HARD BOUNDARY stays intact: no auto tab-opening on a bidding account).
+- **Reminder banner:** on any stat page, shows which pages are overdue ("⏰ давно не сканил: …")
+  so the operator knows to open + Scan them. Just a nudge — no auto-action on pages not open.
+
 ## Install
 Load `optimizeup-metrics/` as an unpacked extension on the teammate's Chrome.
 This is a SEPARATE extension from the radar build — never merge the two.

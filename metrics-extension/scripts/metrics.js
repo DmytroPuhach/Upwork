@@ -1,4 +1,7 @@
-// OptimizeUp Metrics v1.3.0 — Teammate-side metrics tool (content script)
+// OptimizeUp Metrics v1.4.0 — Teammate-side metrics tool (content script)
+// v1.4.0: per-page cadence (my-stats 6h / proposals 2h / connects 24h / notifications 4h).
+//   Auto-scan ONLY the page the operator is already on, if stale (no tab opening, no background).
+//   Reminder banner nudges which pages are overdue. Scan button unchanged.
 // v1.3.0: notifications parser built (notificationsMap via bridge; proposal viewed/hired) — validated
 //   (proposal viewed_at update lands; endpoint now matches by job id). All 4 parsers live.
 // v1.2.0: connects parser built (DOM table #connects-history-table; synthesized stable txn id) — validated.
@@ -291,49 +294,91 @@
   //     Until then, Scan CAPTURES the sample to clipboard so it can be sent for build.
   // ═══════════════════════════════════════════════════════════
 
+  // each scan returns true if it completed (posted OR legitimately nothing to send), false on a real miss
   async function scanMyStats(setStatus) {
     const state = hydrateNuxt3(readNuxt3DataFromPage());
     const stats = parseMyStats(state);
-    if (!stats) { setStatus('❌ parse_empty (open /nx/my-stats and let it load)'); return; }
+    if (!stats) { setStatus('❌ parse_empty (открой /nx/my-stats и дай прогрузиться)'); return false; }
     setStatus('Posting…');
     const r = await post('my-stats', { stats, raw_payload: null });
     setStatus(r.ok ? `✅ saved (jss=${stats.jss ?? '?'}, sent7d=${stats.proposals_sent_7d ?? '?'})` : `❌ ${r.error || ('HTTP ' + r.http)}`);
+    return !!r.ok;
   }
 
   async function scanProposals(setStatus) {
     const nuxt = await readNuxtViaBridge();
     const proposals = parseProposals(nuxt);
-    if (!proposals.length) { setStatus('❌ no proposals in page state (open /nx/proposals and let it load)'); return; }
+    if (!proposals.length) { setStatus('❌ no proposals in page state (дай прогрузиться)'); return false; }
     setStatus(`Posting ${proposals.length}…`);
     const r = await post('proposals', { proposals });
     setStatus(r.ok ? `✅ ${r.ingested || 0} new / ${r.updated || 0} updated (${proposals.length} bids)` : `❌ ${r.error || ('HTTP ' + r.http)}`);
+    return !!r.ok;
   }
 
   async function scanConnects(setStatus) {
     const transactions = parseConnectsHistory();
-    if (!transactions.length) { setStatus('❌ no rows in connects table (let the table load)'); return; }
+    if (!transactions.length) { setStatus('✅ нет транзакций коннектов (пусто)'); return true; }   // legit empty
     setStatus(`Posting ${transactions.length}…`);
     const r = await post('connects-history', { transactions });
     setStatus(r.ok ? `✅ ${r.ingested || 0} ingested (${transactions.length} rows seen)` : `❌ ${r.error || ('HTTP ' + r.http)}`);
+    return !!r.ok;
   }
 
   async function scanNotifications(setStatus) {
     const nuxt = await readNuxtViaBridge();
     const notifications = parseNotifications(nuxt);
-    if (!notifications.length) { setStatus('✅ no proposal-view/hire notifications right now'); return; }
+    if (!notifications.length) { setStatus('✅ нет proposal-view/hire уведомлений'); return true; }
     setStatus(`Posting ${notifications.length}…`);
     const r = await post('notifications', { notifications });
     setStatus(r.ok ? `✅ ${r.updated || 0} proposal(s) updated (${notifications.length} events)` : `❌ ${r.error || ('HTTP ' + r.http)}`);
+    return !!r.ok;
   }
 
-  // ── UI: single Scan button for the current stat page ──
+  // ═══════════════════════════════════════════════════════════
+  // Cadence + reminder. NO background, NO tab opening — auto-scan ONLY runs the page the operator
+  // is already on, and only if it's stale. The banner nudges to visit the other stale pages.
+  // ═══════════════════════════════════════════════════════════
+  const CADENCE = { 'my-stats': 6 * 3600e3, 'proposals': 2 * 3600e3, 'connects-history': 24 * 3600e3, 'notifications': 4 * 3600e3 };
+  const PAGE_LABEL = { 'my-stats': 'stats', 'proposals': 'proposals', 'connects-history': 'connects', 'notifications': 'notifications' };
+  async function getLastScans() { try { const r = await chrome.storage.local.get('ou_metrics_lastscan'); return r.ou_metrics_lastscan || {}; } catch { return {}; } }
+  async function markScanned(page) { const m = await getLastScans(); m[page] = Date.now(); try { await chrome.storage.local.set({ ou_metrics_lastscan: m }); } catch {} }
+  function ago(ts) { if (!ts) return 'никогда'; const h = (Date.now() - ts) / 3600e3; return h < 1 ? `${Math.round(h * 60)}м` : `${Math.round(h)}ч`; }
+  function isStale(page, m) { return (Date.now() - (m[page] || 0)) > (CADENCE[page] || 6 * 3600e3); }
+
+  async function runScan(page, setStatus) {
+    let ok = false;
+    try {
+      if (page === 'my-stats') ok = await scanMyStats(setStatus);
+      else if (page === 'proposals') ok = await scanProposals(setStatus);
+      else if (page === 'connects-history') ok = await scanConnects(setStatus);
+      else if (page === 'notifications') ok = await scanNotifications(setStatus);
+    } catch (e) { setStatus('❌ ' + (e?.message || e)); }
+    if (ok) await markScanned(page);
+    updateReminder();
+    return ok;
+  }
+
+  async function updateReminder() {
+    const el = document.getElementById('ou-metrics-reminder');
+    if (!el) return;
+    const m = await getLastScans();
+    const stale = Object.keys(CADENCE).filter(p => isStale(p, m));
+    if (!stale.length) { el.style.display = 'none'; return; }
+    el.style.display = 'block';
+    el.textContent = '⏰ давно не сканил: ' + stale.map(p => `${PAGE_LABEL[p]} (${ago(m[p])})`).join(', ') + ' — открой и Scan';
+  }
+
+  // ── UI: Scan button + reminder banner + auto-scan-on-visit ──
   function mount() {
     const page = pageType();
     if (!page) return;
     if (document.getElementById('ou-metrics-btn')) return;
 
     const wrap = document.createElement('div');
-    wrap.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483647;font:13px/1.4 -apple-system,Segoe UI,Roboto,sans-serif;display:flex;flex-direction:column;gap:6px;align-items:flex-end;';
+    wrap.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483647;font:13px/1.4 -apple-system,Segoe UI,Roboto,sans-serif;display:flex;flex-direction:column;gap:6px;align-items:flex-end;max-width:320px;';
+    const reminder = document.createElement('div');
+    reminder.id = 'ou-metrics-reminder';
+    reminder.style.cssText = 'background:#fff7e6;border:1px solid #e0b15a;color:#7a5200;border-radius:6px;padding:6px 9px;font-size:11.5px;box-shadow:0 2px 8px rgba(0,0,0,.12);display:none;';
     const btn = document.createElement('button');
     btn.id = 'ou-metrics-btn';
     btn.textContent = `📊 Scan ${page}`;
@@ -344,17 +389,17 @@
 
     btn.onclick = async () => {
       btn.disabled = true; const orig = btn.textContent; btn.textContent = '…';
-      try {
-        if (page === 'my-stats') await scanMyStats(setStatus);
-        else if (page === 'proposals') await scanProposals(setStatus);
-        else if (page === 'connects-history') await scanConnects(setStatus);
-        else if (page === 'notifications') await scanNotifications(setStatus);
-      } catch (e) { setStatus('❌ ' + (e?.message || e)); }
+      await runScan(page, setStatus);
       btn.disabled = false; btn.textContent = orig;
     };
 
-    wrap.append(status, btn);
+    wrap.append(reminder, status, btn);
     document.body.appendChild(wrap);
+    updateReminder();
+    // auto-scan THIS page if it's stale — operator is already here, no tab opened.
+    getLastScans().then(m => {
+      if (isStale(page, m)) { setStatus('авто-скан (давно не сканил)…'); setTimeout(() => runScan(page, setStatus), 1500); }
+    });
     log('mounted on', page);
   }
 
