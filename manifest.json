@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "OptimizeUp Agency Assistant",
-  "version": "19.7.2",
-  "description": "Internal agency tool for OptimizeUp team - v19.7.2 (RADAR): expandable feed rows (chevron → AI annotation/accounts/Cover), reliable job-open via SW; freshness-decay feed.",
+  "version": "19.7.3",
+  "description": "Internal agency tool for OptimizeUp team - v19.7.3 (RADAR): + ↻ С нуля full-refresh button; expandable feed rows (chevron → AI annotation/accounts/Cover); reliable job-open via SW; freshness-decay feed.",
   "permissions": ["storage", "alarms", "activeTab", "scripting", "tabs"],
   "host_permissions": [
     "https://www.upwork.com/*",

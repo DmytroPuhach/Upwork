@@ -1,5 +1,7 @@
 
-// OptimizeUp Extension v18.5.2 — Content Script
+// OptimizeUp Extension v18.5.3 — Content Script
+// v18.5.3: header "↻ С нуля" = full refresh (clears list + ou_seen_jobs dedup, re-reads page so all
+//   jobs count as new). Plain "Clear" only empties the list (seen jobs won't return).
 // v18.5.2: feed row = [▸ chevron][score][title][✕]; chevron/score/title EXPAND the row → detail
 //   (AI annotation + «для кого» + Cover, or pre-score breakdown if not analyzed yet). Removed the
 //   broken "Посмотреть" button. Opening the real job now goes through the SW (OPEN_JOB_TAB) because
@@ -989,9 +991,19 @@
     count.id = PANEL_ID + '-count';
     const left = panelEl('div', 'display:flex;gap:8px;align-items:center;');
     left.append(title, count);
-    const clear = panelEl('button', `background:rgba(255,255,255,0.2);border:1px solid rgba(255,255,255,0.5);color:#fff;border-radius:6px;padding:2px 8px;font-size:11px;cursor:pointer;`, 'Clear');
-    clear.onclick = () => { const l = document.getElementById(PANEL_ID + '-list'); if (l) [...l.querySelectorAll('[data-ou-card]')].forEach(n => n.remove()); try { chrome.storage.local.set({ [PANEL_STORE_KEY]: [] }); } catch {} showList(); updatePanelCount(); };
-    header.append(left, clear);
+    const btnCss = `background:rgba(255,255,255,0.2);border:1px solid rgba(255,255,255,0.5);color:#fff;border-radius:6px;padding:2px 8px;font-size:11px;cursor:pointer;white-space:nowrap;`;
+    const clearList = () => { const l = document.getElementById(PANEL_ID + '-list'); if (l) [...l.querySelectorAll('[data-ou-card]')].forEach(n => n.remove()); try { chrome.storage.local.set({ [PANEL_STORE_KEY]: [] }); } catch {} showList(); updatePanelCount(); };
+    const clear = panelEl('button', btnCss, 'Clear');
+    clear.title = 'Очистить список (уже виденные не вернутся — придут только новые)';
+    clear.onclick = clearList;
+    // "С нуля" = full refresh: clears the list AND the seen-dedup, then re-reads the current page so
+    // everything counts as new again (use when old jobs sit on top and you want a fresh sweep).
+    const reset = panelEl('button', btnCss, '↻ С нуля');
+    reset.title = 'Полный рефреш: список + дедуп → показать всю выдачу как новую';
+    reset.onclick = () => { clearList(); try { sessionStorage.removeItem('ou_seen_jobs'); } catch {} handleJobCards(); };
+    const btns = panelEl('div', 'display:flex;gap:6px;align-items:center;');
+    btns.append(reset, clear);
+    header.append(left, btns);
 
     const stats = panelEl('div', 'padding:5px 11px;background:#f5f8f5;border-bottom:1px solid #e8eee8;font:11px/1.4 monospace;color:#3c4a3c;flex:none;');
     stats.id = PANEL_ID + '-stats';
