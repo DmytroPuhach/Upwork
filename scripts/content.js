@@ -1,5 +1,8 @@
 
-// OptimizeUp Extension v18.5.3 — Content Script
+// OptimizeUp Extension v18.5.4 — Content Script
+// v18.5.4: feed number == sort key (single rank). Shown number now ALWAYS matches top→down order
+//   (was: sorted by quality+freshness but displayed quality only → looked unordered). Pre-score rank
+//   = quality + freshness decay; analyzed = AI score. 75s refreshFeed re-renders so ranks age live.
 // v18.5.3: header "↻ С нуля" = full refresh (clears list + ou_seen_jobs dedup, re-reads page so all
 //   jobs count as new). Plain "Clear" only empties the list (seen jobs won't return).
 // v18.5.2: feed row = [▸ chevron][score][title][✕]; chevron/score/title EXPAND the row → detail
@@ -1023,8 +1026,8 @@
     panel.append(header, stats, list, detail);
     document.body.appendChild(panel);
     makeDraggable(panel, header);
-    // Re-sort every 75s so jobs age and sink even when no new card arrives.
-    if (!window.__ouAgingTimer) window.__ouAgingTimer = setInterval(() => { try { sortListRows(); } catch {} }, 75000);
+    // Re-render every 75s so ranks age (freshness decays) and the feed re-sorts even with no new card.
+    if (!window.__ouAgingTimer) window.__ouAgingTimer = setInterval(() => { try { refreshFeed(); } catch {} }, 75000);
     return panel;
   }
 
@@ -1102,13 +1105,15 @@
     else wrap.textContent = '';
 
     const analyzed = card.match_score != null;
-    // sort inputs: quality (AI score if analyzed, else pre-score) + posted time + status. Freshness
-    // decay + skipped-sink are applied in sortListRows, so quality stays a stable number.
-    wrap.setAttribute('data-ou-quality', String(analyzed ? card.match_score : (card.prematch_score != null ? card.prematch_score : -1)));
-    wrap.setAttribute('data-ou-posted', String(card.posted_at_ms || 0));
+    // SINGLE rank = what we show AND what we sort by (so the feed always reads top→down by its number).
+    // analyzed → stable AI score; pre-scored → quality + freshness decay (fresh floats up, ages down).
+    const ageMin = card.posted_at_ms ? (Date.now() - card.posted_at_ms) / 60000 : null;
+    const base = analyzed ? card.match_score : (card.prematch_score != null ? card.prematch_score : 0);
+    const rank = analyzed ? base : Math.max(0, Math.min(99, Math.round(base + freshnessAdj(ageMin))));
+    wrap.setAttribute('data-ou-rank', String(rank));
     wrap.setAttribute('data-ou-status', card.status || 'pending');
-    const scColor = analyzed ? (card.match_score >= 70 ? '#14a800' : card.match_score >= 50 ? '#b35900' : '#9aa0a6') : (card.prematch_score != null ? '#3c8dbc' : '#9aa0a6');
-    const scoreText = analyzed ? String(card.match_score) : (card.prematch_score != null ? '~' + card.prematch_score : '—');
+    const scColor = rank >= 70 ? '#14a800' : rank >= 50 ? '#b35900' : (analyzed ? '#9aa0a6' : '#3c8dbc');
+    const scoreText = analyzed ? String(rank) : '~' + rank;
 
     const row = panelEl('div', 'display:flex;align-items:center;gap:6px;padding:6px 8px;');
     const chev = panelEl('button', 'background:none;border:0;cursor:pointer;font-size:12px;color:#5e6d55;padding:2px;min-width:14px;', '▸');
@@ -1129,20 +1134,21 @@
     updatePanelCount();
   }
 
-  // Feed order = quality + freshness decay; skipped sink to the bottom. Fresh jobs float up; a job
-  // sinks as it ages even if its quality is high (catch fresh ones first).
+  // Order strictly by the row's shown rank (set in renderListRow), skipped to the bottom — so the
+  // feed always reads top→down by the visible number. Freshness already baked into rank.
   function sortListRows() {
     const list = document.getElementById(PANEL_ID + '-list');
     if (!list) return;
-    const now = Date.now();
-    const eff = (el) => {
-      if (el.getAttribute('data-ou-status') === 'skipped') return -1000;
-      const q = Number(el.getAttribute('data-ou-quality')); if (isNaN(q)) return -999;
-      const posted = Number(el.getAttribute('data-ou-posted')) || 0;
-      const ageMin = posted ? (now - posted) / 60000 : null;
-      return q + freshnessAdj(ageMin);
-    };
-    [...list.querySelectorAll('[data-ou-card]')].sort((a, b) => eff(b) - eff(a)).forEach(r => list.appendChild(r));
+    const v = (el) => el.getAttribute('data-ou-status') === 'skipped' ? -1000 : (Number(el.getAttribute('data-ou-rank')) || -1);
+    [...list.querySelectorAll('[data-ou-card]')].sort((a, b) => v(b) - v(a)).forEach(r => list.appendChild(r));
+  }
+
+  // Re-render visible rows so rank (freshness) decays live; renderListRow re-sorts at the end.
+  async function refreshFeed() {
+    const list = document.getElementById(PANEL_ID + '-list');
+    if (!list) return;
+    const cards = await loadCards();
+    for (const c of cards) { if (list.querySelector(`[data-ou-card="${cardKey(c)}"]`)) renderListRow(c, false); }
   }
 
   function showList() {
