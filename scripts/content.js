@@ -1,5 +1,7 @@
 
-// OptimizeUp Extension v18.1.1 — Content Script
+// OptimizeUp Extension v18.1.2 — Content Script
+// v18.1.2: panel moved LEFT + static (always visible on search page, even empty) with stats bar
+//   (found/skipped/passed today). recordScanStats fed from handleJobCards.
 // v18.1.1: panel persists across auto-reload (chrome.storage); two-step flow — "Просмотр" (open job)
 //   then "Cover →" generates only on explicit click; Skip drops the card from storage.
 // v18.1.0: STEP 2B — operator panel (floating widget). Renders PANEL_CARD from background
@@ -786,6 +788,9 @@
           skippedByPrematch.map(s => s.reason).join(', '));
       }
 
+      // panel stats: detected on this scan / prematch-skipped / passed to enrichment
+      recordScanStats(result.elements.length, skippedByPrematch.length, newJobs.length);
+
       if (newJobs.length > 0) {
         log(`💼 ${newJobs.length} new jobs via ${result.strategy} (after prematch)`);
         reportSuccess('jobs_search', result.strategy, result.elements.length);
@@ -906,7 +911,8 @@
   function ensurePanel() {
     let panel = document.getElementById(PANEL_ID);
     if (panel) return panel;
-    panel = panelEl('div', `position:fixed;right:16px;bottom:16px;width:370px;max-height:82vh;z-index:2147483647;
+    // Static, always-visible, LEFT side (Upwork's left nav is unused for us).
+    panel = panelEl('div', `position:fixed;left:12px;top:90px;width:330px;max-height:80vh;z-index:2147483647;
       background:#fff;border:1px solid #d5d5d5;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.18);
       font:13px/1.4 -apple-system,Segoe UI,Roboto,sans-serif;color:#001e00;display:flex;flex-direction:column;overflow:hidden;`);
     panel.id = PANEL_ID;
@@ -922,17 +928,45 @@
     clear.onclick = () => { const b = document.getElementById(PANEL_ID + '-body'); if (b) b.innerHTML = ''; try { chrome.storage.local.set({ [PANEL_STORE_KEY]: [] }); } catch {} updatePanelCount(); };
     header.append(left, clear);
 
-    const body = panelEl('div', 'overflow-y:auto;padding:8px;display:flex;flex-direction:column;gap:8px;');
-    body.id = PANEL_ID + '-body';
+    // stats bar — found / skipped / passed (today)
+    const stats = panelEl('div', 'padding:5px 12px;background:#f5f8f5;border-bottom:1px solid #e8eee8;font:11px/1.4 monospace;color:#3c4a3c;');
+    stats.id = PANEL_ID + '-stats';
+    stats.textContent = 'found 0 · skipped 0 · passed 0';
 
-    panel.append(header, body);
+    const body = panelEl('div', 'overflow-y:auto;padding:8px;display:flex;flex-direction:column;gap:8px;flex:1;');
+    body.id = PANEL_ID + '-body';
+    const empty = panelEl('div', 'padding:14px 12px;color:#9aa0a6;font-size:12px;text-align:center;', 'Waiting for scored jobs…');
+    empty.id = PANEL_ID + '-empty';
+    body.append(empty);
+
+    panel.append(header, stats, body);
     document.body.appendChild(panel);
     return panel;
+  }
+
+  async function updatePanelStats() {
+    const el = document.getElementById(PANEL_ID + '-stats');
+    if (!el) return;
+    const r = await chrome.storage.local.get('ou_scan_stats');
+    const s = r.ou_scan_stats || {};
+    el.textContent = `found ${s.detected || 0} · skipped ${s.skipped || 0} · passed ${s.passed || 0}  (today)`;
+  }
+
+  async function recordScanStats(detected, skipped, passed) {
+    const today = new Date().toDateString();
+    const r = await chrome.storage.local.get('ou_scan_stats');
+    let s = r.ou_scan_stats || {};
+    if (s.date !== today) s = { date: today, detected: 0, skipped: 0, passed: 0 };
+    s.detected += detected; s.skipped += skipped; s.passed += passed;
+    await chrome.storage.local.set({ ou_scan_stats: s });
+    updatePanelStats();
   }
 
   function updatePanelCount() {
     const body = document.getElementById(PANEL_ID + '-body');
     const count = document.getElementById(PANEL_ID + '-count');
+    const empty = document.getElementById(PANEL_ID + '-empty');
+    if (body && empty) empty.style.display = body.querySelectorAll('[data-ou-card]').length > 0 ? 'none' : 'block';
     if (body && count) count.textContent = String(body.querySelectorAll('[data-ou-card]').length);
   }
 
@@ -1044,9 +1078,11 @@
 
   async function restorePanel() {
     if (getPageType() !== 'jobs_search') return;
+    ensurePanel();                 // static panel always visible on the search page
+    updatePanelStats();
     const cards = await loadCards();
-    if (!cards.length) return;
     [...cards].reverse().forEach(c => renderPanelCard(c, false));   // oldest first → newest ends on top
+    updatePanelCount();
   }
 
   chrome.runtime.onMessage.addListener((msg) => {

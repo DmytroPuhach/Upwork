@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "OptimizeUp Agency Assistant",
-  "version": "19.3.1",
-  "description": "Internal agency tool for OptimizeUp team - v19.3.1 (RADAR): panel persists across auto-reload; two-step Просмотр→Cover flow.",
+  "version": "19.3.2",
+  "description": "Internal agency tool for OptimizeUp team - v19.3.2 (RADAR): static left panel + found/skipped/passed stats.",
   "permissions": ["storage", "alarms", "activeTab", "scripting", "tabs"],
   "host_permissions": [
     "https://www.upwork.com/*",
