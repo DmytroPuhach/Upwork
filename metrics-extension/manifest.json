@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "OptimizeUp Metrics",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Teammate-side metrics tool. Manual 'Scan' on Upwork stat pages only. NO feed monitoring, NO auto-refresh, NO background tabs.",
   "permissions": ["storage"],
   "host_permissions": [

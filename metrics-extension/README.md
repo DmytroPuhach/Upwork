@@ -31,8 +31,12 @@ injected on `/nx/search/jobs`. Keep it that way.
 |---|---|---|
 | my-stats | `parseMyStats` (ported from radar, PROVEN — 62 runs) | ✅ Scan → parse → POST `/profile-sync/my-stats` (verified: row lands) |
 | proposals | `parseProposals` (`__NUXT__.state.lists` via MAIN-world bridge) | ✅ Scan → parse → POST `/profile-sync/proposals` (verified: 2 rows landed) |
-| connects-history | — | 📋 Scan = capture live sample (connects_ledger empty since creation) |
+| connects-history | `parseConnectsHistory` (DOM table `#connects-history-table`) | ✅ Scan → parse → POST `/profile-sync/connects-history` (verified: rows landed in connects_ledger) |
 | notifications | — | 📋 Scan = capture live sample (0 runs ever) |
+
+Note: connects history is client-rendered (not in `__NUXT__`); parsed from the DOM table. Rows have
+no stable txn id and can be identical, so the id is synthesized `${dateISO}#${action}#${delta}#${seq}`
+(stable for historical days). No balance column on the table → `balance_after` is null.
 
 Reading `window.__NUXT__` (live object) requires `scripts/nuxt-bridge.js` (a read-only MAIN-world
 content script) because the isolated content script can't see page globals. my-stats uses the

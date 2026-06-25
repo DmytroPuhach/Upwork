@@ -1,4 +1,5 @@
-// OptimizeUp Metrics v1.1.0 — Teammate-side metrics tool (content script)
+// OptimizeUp Metrics v1.2.0 — Teammate-side metrics tool (content script)
+// v1.2.0: connects parser built (DOM table #connects-history-table; synthesized stable txn id) — validated.
 // v1.1.0: proposals parser built (window.__NUXT__.state.lists via MAIN-world bridge) — validated, rows land.
 //
 // ╔══════════════════════════════════════════════════════════════════════════╗
@@ -187,6 +188,54 @@
     return out;
   }
 
+  // ═══════════════════════════════════════════════════════════
+  // PARSER: /nx/plans/connects/history/  — client-rendered DOM table (NOT in __NUXT__).
+  // <table id="connects-history-table"> rows: td#date-cell-N / action-cell-N / connects-cell-N.
+  // No per-txn id and rows can be identical → synthesize a stable id:
+  //   ${dateISO}#${action}#${delta}#${seqAmongIdenticalThatDay}  (stable for historical days).
+  // No balance column on this table → balance_after = null.
+  // ═══════════════════════════════════════════════════════════
+  function parseConnDate(t) {
+    if (!t) return null;
+    const s = t.trim();
+    if (/^today$/i.test(s)) return new Date().toISOString().slice(0, 10);
+    if (/^yesterday$/i.test(s)) { const d = new Date(); d.setDate(d.getDate() - 1); return d.toISOString().slice(0, 10); }
+    const d = new Date(s);  // "June 24, 2026"
+    return isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
+  }
+
+  function parseConnectsHistory() {
+    const tbl = document.getElementById('connects-history-table')
+      || document.querySelector('table[aria-label*="onnects" i], [role="table"]');
+    if (!tbl) return [];
+    const out = [];
+    const seqMap = {};
+    for (const tr of tbl.querySelectorAll('tbody tr')) {
+      const dateTxt = (tr.querySelector('[id^="date-cell-"]')?.textContent || tr.children[0]?.textContent || '').trim();
+      const action = (tr.querySelector('[id^="action-cell-"]')?.textContent || tr.children[1]?.textContent || '').replace(/\s+/g, ' ').trim();
+      const connCell = tr.querySelector('[id^="connects-cell-"]') || tr.children[tr.children.length - 1];
+      let delta = parseInt((connCell?.querySelector('[aria-hidden="true"]')?.textContent || '').replace(/[^\d-]/g, ''), 10);
+      if (isNaN(delta)) {
+        const sr = connCell?.querySelector('.sr-only')?.textContent || connCell?.textContent || '';
+        const m = sr.match(/(Spent|Earned|Refund\w*|Purchased|Added)\s+(\d+)/i);
+        if (m) delta = (/spent/i.test(m[1]) ? -1 : 1) * parseInt(m[2], 10);
+      }
+      if (isNaN(delta)) continue;
+      const occurredIso = parseConnDate(dateTxt);
+      if (!occurredIso) continue;
+      const key = `${occurredIso}#${action}#${delta}`;
+      const seq = (seqMap[key] = (seqMap[key] ?? -1) + 1);
+      out.push({
+        upwork_transaction_id: `${key}#${seq}`,
+        transaction_type: delta < 0 ? 'spend' : 'earn',
+        delta,
+        occurred_at: occurredIso,
+        description: action || null,
+      });
+    }
+    return out;
+  }
+
   // ── POST helper (anon key + machine_id; no service_role) ──
   async function post(page, body) {
     const account_slug = await resolveAccountSlug();
@@ -228,6 +277,14 @@
     setStatus(r.ok ? `✅ ${r.ingested || 0} new / ${r.updated || 0} updated (${proposals.length} bids)` : `❌ ${r.error || ('HTTP ' + r.http)}`);
   }
 
+  async function scanConnects(setStatus) {
+    const transactions = parseConnectsHistory();
+    if (!transactions.length) { setStatus('❌ no rows in connects table (let the table load)'); return; }
+    setStatus(`Posting ${transactions.length}…`);
+    const r = await post('connects-history', { transactions });
+    setStatus(r.ok ? `✅ ${r.ingested || 0} ingested (${transactions.length} rows seen)` : `❌ ${r.error || ('HTTP ' + r.http)}`);
+  }
+
   async function captureSample(page, setStatus) {
     // First step of building a parser: dump the real Nuxt state (via MAIN-world bridge) + data-test map.
     const bridged = await readNuxtViaBridge();
@@ -252,7 +309,7 @@
 
     const wrap = document.createElement('div');
     wrap.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483647;font:13px/1.4 -apple-system,Segoe UI,Roboto,sans-serif;display:flex;flex-direction:column;gap:6px;align-items:flex-end;';
-    const built = (page === 'my-stats' || page === 'proposals');   // parsers proven for these
+    const built = (page === 'my-stats' || page === 'proposals' || page === 'connects-history');   // parsers proven for these
     const btn = document.createElement('button');
     btn.id = 'ou-metrics-btn';
     btn.textContent = built ? `📊 Scan ${page}` : `📋 Capture ${page} sample`;
@@ -266,6 +323,7 @@
       try {
         if (page === 'my-stats') await scanMyStats(setStatus);
         else if (page === 'proposals') await scanProposals(setStatus);
+        else if (page === 'connects-history') await scanConnects(setStatus);
         else await captureSample(page, setStatus);
       } catch (e) { setStatus('❌ ' + (e?.message || e)); }
       btn.disabled = false; btn.textContent = orig;
