@@ -1,5 +1,7 @@
 
-// OptimizeUp Extension v18.4.0 — Content Script
+// OptimizeUp Extension v18.4.1 — Content Script
+// v18.4.1: AI reads the description from the operator's OWN open job page (extractDescriptionFromPage)
+//   → ANALYZE_FROM_PAGE. No background enrich tab opened (bot-detection safety).
 // v18.4.0: detail panel now lives ON the job page. Посмотреть (feed) opens the job tab; that tab
 //   shows the detail (AI verdict + accounts + Cover + ← Закрыть) via initJobDetailPanel + triggers AI.
 //   Search tab stays the feed. Scored updates broadcast to all upwork tabs.
@@ -1188,7 +1190,35 @@
     window.open(card.url || '#', '_blank');
   }
 
-  // On the job-detail page: show the detail panel for THIS job; trigger AI if not scored yet.
+  // Read the full description straight from THIS open job page (no extra tab → no bot footprint).
+  function extractDescriptionFromPage() {
+    const sels = ['[data-test="Description"]', '[data-test="JobDescription"]', '[data-test="job-description-text"]', 'section[aria-label*="description" i]'];
+    for (const s of sels) { const el = document.querySelector(s); const t = (el?.textContent || '').trim(); if (t.length >= 200) return t; }
+    const ps = [...document.querySelectorAll('p')].map(p => (p.textContent || '').trim()).filter(t => t.length > 120).sort((a, b) => b.length - a.length);
+    if (ps[0] && ps[0].length >= 200) return ps[0];
+    const pageLen = (document.body?.textContent || '').length;
+    const cands = [...document.querySelectorAll('section,div[class]')].filter(el => { if (el.closest('nav,header,footer')) return false; const t = (el.textContent || '').trim(); return t.length >= 200 && t.length < pageLen * 0.55; }).sort((a, b) => a.children.length - b.children.length);
+    return cands[0] ? (cands[0].textContent || '').trim().slice(0, 10000) : '';
+  }
+  async function waitForDescriptionOnPage(maxMs = 12000) {
+    const start = Date.now();
+    while (Date.now() - start < maxMs) { const d = extractDescriptionFromPage(); if (d && d.length >= 200) return d; await new Promise(r => setTimeout(r, 500)); }
+    return extractDescriptionFromPage();
+  }
+  function extractClientFromPage() {
+    const ac = document.querySelector('[data-test="about-client-container"]');
+    const txt = (ac?.textContent || document.body?.textContent || '');
+    const out = {}; let m;
+    if ((m = txt.match(/Rating is\s+([\d.]+)\s+out of 5/i))) out.rating = parseFloat(m[1]);
+    if ((m = txt.match(/\$([\d,]+(?:\.\d+)?[KkMm]?)\+?\s*total\s*spent/i))) out.total_spent = m[1];
+    if ((m = txt.match(/(\d[\d,]*)\s*hires?/i))) out.hires = parseInt(m[1].replace(/,/g, ''));
+    if ((m = txt.match(/(\d{1,3})%\s*hire rate/i))) out.hire_rate = parseInt(m[1]) / 100;
+    if ((m = txt.match(/Member since\s+([A-Z][a-z]+\s+\d{1,2},?\s+\d{4})/i))) out.member_since = m[1];
+    if (/Payment method verified|Payment verified/i.test(txt)) out.payment_verified = true;
+    return out;
+  }
+
+  // On the job-detail page: show the detail panel for THIS job; AI reads the page in place (no tab).
   async function initJobDetailPanel() {
     const key = cardIdFromUrl();
     if (!key) return;
@@ -1199,10 +1229,15 @@
     const stats = document.getElementById(PANEL_ID + '-stats'); if (stats) stats.style.display = 'none';
     showDetail(key);
     if (card.match_score == null) {
-      chrome.runtime.sendMessage({ type: 'ANALYZE_JOB', payload: {
-        upwork_id: card.upwork_id, url: card.url, title: card.title,
-        matched_skills: card.matched_skills, total_skills: card.total_skills,
-        posted_ago_min: card.posted_ago_min, client_country: card.client_country,
+      const desc = await waitForDescriptionOnPage();
+      if (!desc || desc.length < 200) { await patchCard(key, { analyzeError: 'нет описания на странице' }); renderDetail(key); return; }
+      const enrichment = {
+        ok: true, upwork_job_id: card.upwork_id, url: location.href, title: card.title,
+        description: desc, budget_raw: card.budget, skills: Array.isArray(card.skills) ? card.skills : [],
+        screening_questions: [], client: extractClientFromPage(), meta: {},
+      };
+      chrome.runtime.sendMessage({ type: 'ANALYZE_FROM_PAGE', payload: {
+        upwork_id: card.upwork_id, enrichment, matched_skills: card.matched_skills, total_skills: card.total_skills,
       }}).then(r => { if (!r?.ok) { patchCard(key, { analyzeError: r?.error || 'fail' }).then(() => renderDetail(key)); } });
     }
   }

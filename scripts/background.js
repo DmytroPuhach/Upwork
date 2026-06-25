@@ -1,4 +1,6 @@
-// OptimizeUp Extension v19.4.1 — Background Service Worker
+// OptimizeUp Extension v19.6.1 — Background Service Worker
+// v19.6.1: AI never opens tabs. ANALYZE_FROM_PAGE scores the description content.js read off the
+//   operator's OWN open job page (no enrich tab). processNextCandidate/reviewJob disabled (dead).
 // v19.4.1: sendPanelCard broadcasts the scored card to ALL upwork tabs (search feed + the job-detail
 //   tab the operator opened — the detail panel now lives on the job page).
 // v19.4.0: operator-gated AI — removed auto enrich+score. ANALYZE_JOB opens job + enrich + score_route
@@ -359,15 +361,20 @@ async function logEvent(status, details) {
   } catch {}
 }
 
-// processNextCandidate — pull one item from buffer and review it
+// processNextCandidate — DISABLED under operator-gated AI (v19.6.1).
+// Nothing auto-opens job tabs anymore. AI runs only when the operator opens a job page itself
+// (content.js reads it in place → ANALYZE_FROM_PAGE). Keeping this a no-op kills the last
+// auto-tab-opening path — the radar account never opens jobs by itself (bot-detection safety).
 async function processNextCandidate() {
+  return;
+  /* legacy auto-enrich path below — intentionally unreachable */
+  // eslint-disable-next-line no-unreachable
   if (activeJobLock) return;
 
   const { cachedIdentity, pausedUntilUpdate, scrapingActive } = await chrome.storage.local.get([
     'cachedIdentity', 'pausedUntilUpdate', 'scrapingActive'
   ]);
   if (pausedUntilUpdate) return;
-  // Radar: process candidates only while the operator has scanning ON.
   if (RADAR_BUILD) { if (!scrapingActive) return; }
   else if (!cachedIdentity?.member?.is_bidding_enabled) return;
 
@@ -544,20 +551,43 @@ async function sendPanelCard(card) {
   } catch (e) { console.warn('[OU] sendPanelCard error:', e); }
 }
 
-// Operator pressed Analyze on a light card → open the job + enrich + score_route NOW (on demand).
-// reviewJob pushes PANEL_CARD (with upwork_id + score) which updates the light card in place.
-async function handleAnalyzeJob(payload) {
-  if (!payload?.url) return { ok: false, error: 'no url' };
-  if (activeJobLock) return { ok: false, error: 'busy — another analyze in progress' };
-  activeJobLock = true;
+// Operator opened the job page; content.js read the description IN PLACE and sent it here.
+// We score WITHOUT opening any tab (no bot footprint). enrichment = ENRICH_RESULT shape from the page.
+async function handleAnalyzeFromPage(payload) {
+  const enrichment = payload?.enrichment;
+  if (!enrichment?.description || enrichment.description.length < 200) return { ok: false, error: 'no description from page' };
   try {
-    const scoreData = await reviewJob({ ...payload, forceAnalyze: true, queued_at: Date.now() });
-    if (!scoreData) return { ok: false, error: 'could not read job (no description / blocked / removed)' };
+    const { machineId, cachedIdentity } = await chrome.storage.local.get(['machineId', 'cachedIdentity']);
+    const res = await fetch(`${SB_URL}/functions/v1/extension-job-enrich`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SB_ANON_KEY}` },
+      body: JSON.stringify({
+        machine_id: machineId,
+        account_slug: cachedIdentity?.member?.slug,
+        enrichment,
+        search_title: enrichment.title || null,
+        matched_skills: Number(payload.matched_skills) || 0,
+        total_skills: Number(payload.total_skills) || 0,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    const scoreData = data?.score || null;
+    if (!scoreData || !scoreData.job_id) return { ok: false, error: data?.error || 'no score' };
+    await sendPanelCard({
+      job_id: scoreData.job_id,
+      upwork_id: payload.upwork_id || enrichment.upwork_job_id,
+      title: enrichment.title || '',
+      url: enrichment.url,
+      full_text: enrichment.description,
+      match_score: scoreData.match_score ?? null,
+      decision: scoreData.decision || null,
+      breakdown: scoreData.breakdown || {},
+      detected_tech_stack: scoreData.detected_tech_stack || [],
+      account_fit: Array.isArray(scoreData.account_fit) ? scoreData.account_fit : [],
+    });
     return { ok: true, scored: true };
   } catch (e) {
     return { ok: false, error: String(e?.message || e) };
-  } finally {
-    activeJobLock = false;
   }
 }
 
@@ -664,8 +694,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     handleApproveCovers(msg.payload).then(r => sendResponse(r)).catch(e => sendResponse({ error: String(e) }));
     return true;
   }
-  if (msg?.type === 'ANALYZE_JOB') {
-    handleAnalyzeJob(msg.payload).then(r => sendResponse(r)).catch(e => sendResponse({ error: String(e) }));
+  if (msg?.type === 'ANALYZE_FROM_PAGE') {
+    handleAnalyzeFromPage(msg.payload).then(r => sendResponse(r)).catch(e => sendResponse({ error: String(e) }));
     return true;
   }
   if (msg?.type === 'GET_IDENTITY') {
