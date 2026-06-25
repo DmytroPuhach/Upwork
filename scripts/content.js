@@ -1,5 +1,8 @@
 
-// OptimizeUp Extension v18.2.1 — Content Script
+// OptimizeUp Extension v18.3.0 — Content Script
+// v18.3.0: two-screen panel. SCREEN 1 = feed (score/pre-score · title · [Посмотреть] · ✕), NO freelancers.
+//   Посмотреть → opens job + AI → SCREEN 2 = detail (← Назад, AI verdict, "для кого" accounts, Cover).
+//   Fixed scroll (min-height:0). Status colors persist (pending/skipped/sent).
 // v18.2.1: cheap heuristic pre-score (~NN, blue) on light cards so the feed ranks pre-AI;
 //   stats 'found' = NEW jobs (skipped+passed), not re-seen page total.
 // v18.2.0: operator-gated AI — prematch-passed jobs render as LIGHT cards (search data only, no tab/Claude).
@@ -833,7 +836,7 @@
         // operator-gated: render LIGHT cards from search data (no tab, no Claude).
         // AI scoring happens later, per card, when the operator clicks Analyze.
         for (const j of newJobs.slice(0, 15)) {
-          renderCard({
+          renderListRow({
             upwork_id: j.upwork_id,
             url: j.url,
             title: j.title,
@@ -978,20 +981,25 @@
     const left = panelEl('div', 'display:flex;gap:8px;align-items:center;');
     left.append(title, count);
     const clear = panelEl('button', `background:rgba(255,255,255,0.2);border:1px solid rgba(255,255,255,0.5);color:#fff;border-radius:6px;padding:2px 8px;font-size:11px;cursor:pointer;`, 'Clear');
-    clear.onclick = () => { const b = document.getElementById(PANEL_ID + '-body'); if (b) b.innerHTML = ''; try { chrome.storage.local.set({ [PANEL_STORE_KEY]: [] }); } catch {} updatePanelCount(); };
+    clear.onclick = () => { const l = document.getElementById(PANEL_ID + '-list'); if (l) [...l.querySelectorAll('[data-ou-card]')].forEach(n => n.remove()); try { chrome.storage.local.set({ [PANEL_STORE_KEY]: [] }); } catch {} showList(); updatePanelCount(); };
     header.append(left, clear);
 
-    const stats = panelEl('div', 'padding:5px 11px;background:#f5f8f5;border-bottom:1px solid #e8eee8;font:11px/1.4 monospace;color:#3c4a3c;');
+    const stats = panelEl('div', 'padding:5px 11px;background:#f5f8f5;border-bottom:1px solid #e8eee8;font:11px/1.4 monospace;color:#3c4a3c;flex:none;');
     stats.id = PANEL_ID + '-stats';
     stats.textContent = 'found 0 · skipped 0 · passed 0';
 
-    const body = panelEl('div', 'overflow-y:auto;padding:6px;display:flex;flex-direction:column;gap:5px;flex:1;');
-    body.id = PANEL_ID + '-body';
+    // SCREEN 1 — list (the feed). min-height:0 makes overflow actually scroll inside a flex column.
+    const list = panelEl('div', 'overflow-y:auto;min-height:0;flex:1;padding:6px;display:flex;flex-direction:column;gap:5px;');
+    list.id = PANEL_ID + '-list';
     const empty = panelEl('div', 'padding:14px 12px;color:#9aa0a6;font-size:12px;text-align:center;', 'Ждём подходящие вакансии…');
     empty.id = PANEL_ID + '-empty';
-    body.append(empty);
+    list.append(empty);
 
-    panel.append(header, stats, body);
+    // SCREEN 2 — detail (one job: AI verdict + accounts + Cover + Back). Hidden until "Посмотреть".
+    const detail = panelEl('div', 'display:none;overflow-y:auto;min-height:0;flex:1;');
+    detail.id = PANEL_ID + '-detail';
+
+    panel.append(header, stats, list, detail);
     document.body.appendChild(panel);
     makeDraggable(panel, header);
     return panel;
@@ -1016,11 +1024,13 @@
   }
 
   function updatePanelCount() {
-    const body = document.getElementById(PANEL_ID + '-body');
+    const list = document.getElementById(PANEL_ID + '-list');
     const count = document.getElementById(PANEL_ID + '-count');
     const empty = document.getElementById(PANEL_ID + '-empty');
-    if (body && empty) empty.style.display = body.querySelectorAll('[data-ou-card]').length > 0 ? 'none' : 'block';
-    if (body && count) count.textContent = String(body.querySelectorAll('[data-ou-card]').length);
+    if (!list) return;
+    const n = list.querySelectorAll('[data-ou-card]').length;
+    if (empty) empty.style.display = n > 0 ? 'none' : 'block';
+    if (count) count.textContent = String(n);
   }
 
   // Persistence — feed survives the radar's auto-reload. Keyed by upwork_id (present light AND scored).
@@ -1045,143 +1055,164 @@
     if (i >= 0) { cards[i] = { ...cards[i], ...patch }; try { await chrome.storage.local.set({ [PANEL_STORE_KEY]: cards }); } catch {} }
   }
 
-  // Feed row. LIGHT (no score yet): "— title 🔍 ✕", 🔍 = Analyze (opens job + AI on demand).
-  // SCORED (after Analyze): "score title 👁 ✕", expand → accounts + Cover.
-  // Status: pending green · skipped struck · sent (cover) green-struck. Rows persist as a decision log.
-  function renderPanelCard(card, persist = true) {
+  let currentDetailKey = null;   // which job the detail screen is showing (null = list screen)
+
+  function styleRow(wrap, titleEl, s) {
+    if (s === 'skipped') { wrap.style.borderLeftColor = '#b0b0b0'; wrap.style.opacity = '.55'; titleEl.style.textDecoration = 'line-through'; titleEl.style.color = '#888'; }
+    else if (s === 'sent') { wrap.style.borderLeftColor = '#14a800'; wrap.style.opacity = '1'; titleEl.style.textDecoration = 'line-through'; titleEl.style.color = '#14a800'; }
+    else { wrap.style.borderLeftColor = '#14a800'; wrap.style.opacity = '1'; titleEl.style.textDecoration = 'none'; titleEl.style.color = '#001e00'; }
+  }
+
+  // SCREEN 1 row: score/pre-score + title + [Посмотреть] + ✕. No freelancer info here — that's screen 2.
+  function renderListRow(card, persist = true) {
     ensurePanel();
-    const body = document.getElementById(PANEL_ID + '-body');
-    if (!body) return;
+    const list = document.getElementById(PANEL_ID + '-list');
+    if (!list) return;
     const key = cardKey(card);
     if (persist) upsertCard(card);
-    if (body.querySelector(`[data-ou-card="${key}"]`)) return;   // already on screen
+
+    let wrap = list.querySelector(`[data-ou-card="${key}"]`);
+    const fresh = !wrap;
+    if (!wrap) { wrap = panelEl('div', 'border:1px solid #e4e4e4;border-left:3px solid #14a800;border-radius:6px;'); wrap.setAttribute('data-ou-card', key); }
+    else wrap.textContent = '';
 
     const analyzed = card.match_score != null;
-    const wrap = panelEl('div', 'border:1px solid #e4e4e4;border-left:3px solid #14a800;border-radius:6px;overflow:hidden;');
-    wrap.setAttribute('data-ou-card', key);
-
-    // ── collapsed row ──
-    const head = panelEl('div', 'display:flex;align-items:center;gap:6px;padding:6px 8px;cursor:pointer;');
-    // AI score (green tiers) once analyzed; otherwise the cheap pre-score "~NN" (blue = heuristic).
-    const scColor = analyzed
-      ? (card.match_score >= 70 ? '#14a800' : card.match_score >= 50 ? '#b35900' : '#9aa0a6')
-      : (card.prematch_score != null ? '#3c8dbc' : '#9aa0a6');
+    const scColor = analyzed ? (card.match_score >= 70 ? '#14a800' : card.match_score >= 50 ? '#b35900' : '#9aa0a6') : (card.prematch_score != null ? '#3c8dbc' : '#9aa0a6');
     const scoreText = analyzed ? String(card.match_score) : (card.prematch_score != null ? '~' + card.prematch_score : '—');
-    const scoreBadge = panelEl('span', `font-weight:700;font-size:13px;color:${scColor};min-width:26px;text-align:center;`, scoreText);
-    scoreBadge.title = analyzed ? 'AI score' : 'pre-score (эвристика по карточке, до AI)';
-    const titleEl = panelEl('span', 'flex:1;font-weight:600;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;', card.title || '(untitled)');
-    const eye = panelEl('button', 'background:none;border:0;cursor:pointer;font-size:14px;padding:1px 3px;', '👁');
-    eye.title = 'Открыть вакансию';
-    eye.onclick = (e) => { e.stopPropagation(); window.open(card.url || '#', '_blank', 'noopener'); };
-    const skipBtn = panelEl('button', 'background:none;border:0;cursor:pointer;font-size:13px;padding:1px 3px;color:#b0b0b0;', '✕');
-    skipBtn.title = 'Отклонить';
-    head.append(scoreBadge, titleEl, eye, skipBtn);
 
-    const detail = panelEl('div', 'display:none;padding:2px 9px 9px;border-top:1px solid #f0f0f0;');
-    const st = panelEl('div', 'font-size:11px;color:#5e6d55;margin:4px 0;min-height:13px;');
-    if (card.coverStatus) st.textContent = card.coverStatus;
-
-    const applyStatus = (s) => {
-      if (s === 'skipped') { wrap.style.borderLeftColor = '#b0b0b0'; wrap.style.opacity = '.6'; titleEl.style.textDecoration = 'line-through'; titleEl.style.color = '#888'; }
-      else if (s === 'sent') { wrap.style.borderLeftColor = '#14a800'; wrap.style.opacity = '1'; titleEl.style.textDecoration = 'line-through'; titleEl.style.color = '#14a800'; }
-      else { wrap.style.borderLeftColor = '#14a800'; wrap.style.opacity = '1'; titleEl.style.textDecoration = 'none'; titleEl.style.color = '#001e00'; }
-    };
-
-    if (!analyzed) {
-      // LIGHT — search-card facts + Analyze (the only thing that opens the job + spends Claude)
-      const facts = [
-        card.budget,
-        card.client_country,
-        card.client_rating != null ? `★${card.client_rating}` : null,
-        card.client_spent_rough != null ? `$${card.client_spent_rough} spent` : null,
-        card.proposals_min != null ? `${card.proposals_min}+ proposals` : null,
-        (card.matched_skills != null && card.total_skills) ? `skills ${card.matched_skills}/${card.total_skills}` : null,
-      ].filter(Boolean).join(' · ');
-      if (facts) detail.append(panelEl('div', 'font:10.5px/1.4 monospace;color:#5e6d55;margin:6px 0;', facts));
-      const analyzeBtn = panelEl('button', 'width:100%;background:#3c8dbc;color:#fff;border:0;border-radius:6px;padding:7px;font-weight:600;cursor:pointer;', '🔍 Analyze (open + AI)');
-      analyzeBtn.onclick = async (e) => {
-        e.stopPropagation();
-        analyzeBtn.disabled = true; analyzeBtn.style.opacity = '.6'; analyzeBtn.textContent = 'Анализирую (открываю + AI)…';
-        try {
-          const r = await chrome.runtime.sendMessage({ type: 'ANALYZE_JOB', payload: {
-            upwork_id: card.upwork_id, url: card.url, title: card.title,
-            matched_skills: card.matched_skills, total_skills: card.total_skills,
-            posted_ago_min: card.posted_ago_min, client_country: card.client_country,
-          }});
-          if (!r?.ok) { analyzeBtn.disabled = false; analyzeBtn.style.opacity = '1'; analyzeBtn.textContent = '🔍 Analyze (retry)'; st.textContent = '❌ ' + (r?.error || 'fail'); }
-          // on success background pushes PANEL_CARD (scored) → row re-renders with score+accounts
-        } catch (e2) { analyzeBtn.disabled = false; analyzeBtn.style.opacity = '1'; st.textContent = '❌ ' + (e2?.message || e2); }
-      };
-      detail.append(analyzeBtn, st);
-    } else {
-      // SCORED — breakdown + account_fit + Cover
-      const b = card.breakdown || {};
-      const bits = ['niche', 'stack', 'client', 'pain', 'dach', 'market'].filter(k => b[k] != null).map(k => `${k}:${b[k]}`).join(' ');
-      if (bits) detail.append(panelEl('div', 'font:10px/1.3 monospace;color:#5e6d55;margin:6px 0;', bits));
-      const fit = Array.isArray(card.account_fit) ? card.account_fit : [];
-      const checks = [];
-      if (fit.length === 0) {
-        detail.append(panelEl('div', 'font-size:11px;color:#9aa0a6;font-style:italic;margin:4px 0;', 'Нет подходящих аккаунтов.'));
-      } else {
-        const list = panelEl('div', 'display:flex;flex-direction:column;gap:4px;margin:4px 0 8px;');
-        for (const f of fit) {
-          const r = panelEl('label', 'display:flex;gap:6px;align-items:flex-start;cursor:pointer;');
-          const cb = document.createElement('input'); cb.type = 'checkbox'; cb.value = f.account_slug;
-          cb.style.cssText = 'margin-top:2px;'; cb.checked = (card.decision && card.decision !== 'skip');
-          checks.push(cb);
-          const m = panelEl('div', 'flex:1;');
-          m.append(panelEl('div', 'font-weight:600;font-size:12px;', `${f.account_slug} · ${f.fit_score != null ? f.fit_score : '?'}`));
-          if (f.why_account) m.append(panelEl('div', 'font-size:10.5px;color:#5e6d55;', f.why_account));
-          if (f.risks) m.append(panelEl('div', 'font-size:10px;color:#b35900;', '⚠ ' + f.risks));
-          r.append(cb, m); list.append(r);
-        }
-        detail.append(list);
-      }
-      const coverBtn = panelEl('button', `width:100%;background:#14a800;color:#fff;border:0;border-radius:6px;padding:7px;font-weight:600;cursor:pointer;${fit.length ? '' : 'opacity:.4;pointer-events:none;'}`, 'Cover →');
-      coverBtn.onclick = async () => {
-        const accounts = checks.filter(c => c.checked).map(c => c.value);
-        if (accounts.length === 0) { st.textContent = 'Отметь аккаунт(ы).'; return; }
-        coverBtn.disabled = true; coverBtn.style.opacity = '.5'; st.textContent = `Генерю ${accounts.length}…`;
-        try {
-          const resp = await chrome.runtime.sendMessage({ type: 'APPROVE_COVERS', payload: { job_id: card.job_id, full_text: card.full_text, accounts } });
-          const results = resp?.results || [];
-          const line = results.map(r => `${r.account_slug}: ${r.tg_sent ? '✅' : (r.ok ? '⚠' : '❌')}`).join(' · ');
-          st.textContent = line; coverBtn.textContent = 'Отправлено';
-          applyStatus('sent'); patchCard(key, { coverStatus: line, status: 'sent' });
-        } catch (e) { st.textContent = '❌ ' + (e?.message || e); coverBtn.disabled = false; coverBtn.style.opacity = '1'; }
-      };
-      detail.append(st, coverBtn);
-    }
-
-    skipBtn.onclick = (e) => { e.stopPropagation(); applyStatus('skipped'); patchCard(key, { status: 'skipped' }); };
-    head.onclick = () => { detail.style.display = detail.style.display === 'none' ? 'block' : 'none'; };
-
-    wrap.append(head, detail);
-    applyStatus(card.status || 'pending');
-    body.prepend(wrap);
+    const row = panelEl('div', 'display:flex;align-items:center;gap:7px;padding:6px 8px;');
+    const sb = panelEl('span', `font-weight:700;font-size:13px;color:${scColor};min-width:26px;text-align:center;`, scoreText);
+    sb.title = analyzed ? 'AI score' : 'pre-score (эвристика, до AI)';
+    const t = panelEl('span', 'flex:1;font-weight:600;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer;', card.title || '(untitled)');
+    const view = panelEl('button', 'background:#3c8dbc;color:#fff;border:0;border-radius:5px;padding:4px 9px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap;', 'Посмотреть');
+    const x = panelEl('button', 'background:none;border:0;cursor:pointer;font-size:13px;color:#b0b0b0;padding:2px;', '✕');
+    x.title = 'Отклонить';
+    const open = (e) => { if (e) e.stopPropagation(); openAndAnalyze(key); };
+    view.onclick = open; t.onclick = open;
+    x.onclick = (e) => { e.stopPropagation(); patchCard(key, { status: 'skipped' }); styleRow(wrap, t, 'skipped'); };
+    row.append(sb, t, view, x);
+    wrap.append(row);
+    styleRow(wrap, t, card.status || 'pending');
+    if (fresh) list.prepend(wrap);
     updatePanelCount();
   }
 
-  // Background pushes a SCORED card (after Analyze) → merge onto the existing light row and re-render.
+  function showList() {
+    currentDetailKey = null;
+    const list = document.getElementById(PANEL_ID + '-list'); const detail = document.getElementById(PANEL_ID + '-detail');
+    if (detail) detail.style.display = 'none';
+    if (list) list.style.display = 'flex';
+  }
+
+  function showDetail(key) {
+    currentDetailKey = key;
+    const list = document.getElementById(PANEL_ID + '-list'); const detail = document.getElementById(PANEL_ID + '-detail');
+    if (list) list.style.display = 'none';
+    if (detail) detail.style.display = 'block';
+    renderDetail(key);
+  }
+
+  // SCREEN 2: one job — Back, title, open-link, AI verdict + breakdown, accounts ("для кого"), Cover.
+  async function renderDetail(key) {
+    const detail = document.getElementById(PANEL_ID + '-detail');
+    if (!detail || currentDetailKey !== key) return;
+    const card = (await loadCards()).find(c => cardKey(c) === key);
+    if (!card) { showList(); return; }
+    detail.textContent = '';
+
+    const back = panelEl('button', 'background:#f2f2f2;border:1px solid #d5d5d5;border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer;margin:9px 9px 4px;', '← Назад к списку');
+    back.onclick = showList;
+    detail.append(back);
+    detail.append(panelEl('div', 'font-weight:700;font-size:13px;padding:2px 11px 2px;', card.title || '(untitled)'));
+    const openLink = panelEl('button', 'background:none;border:0;color:#3c8dbc;cursor:pointer;font-size:12px;padding:0 11px 6px;text-align:left;', '↗ открыть вакансию');
+    openLink.onclick = () => window.open(card.url || '#', '_blank', 'noopener');
+    detail.append(openLink);
+
+    if (card.match_score == null) {
+      detail.append(panelEl('div', card.analyzeError ? 'padding:12px 11px;color:#b35900;font-size:12px;' : 'padding:12px 11px;color:#3c8dbc;font-size:12px;',
+        card.analyzeError ? ('Не удалось разобрать: ' + card.analyzeError + ' — открой вручную ↗') : '🔍 AI читает вакансию…'));
+      return;
+    }
+
+    const scColor = card.match_score >= 70 ? '#14a800' : card.match_score >= 50 ? '#b35900' : '#9aa0a6';
+    detail.append(panelEl('div', `padding:2px 11px;font-weight:700;color:${scColor};`, `AI: ${card.match_score}/100 · ${card.decision || ''}`));
+    const b = card.breakdown || {};
+    const bits = ['niche', 'stack', 'client', 'pain', 'dach', 'market'].filter(k => b[k] != null).map(k => `${k}:${b[k]}`).join(' ');
+    if (bits) detail.append(panelEl('div', 'font:10px/1.3 monospace;color:#5e6d55;padding:2px 11px 6px;', bits));
+
+    const fit = Array.isArray(card.account_fit) ? card.account_fit : [];
+    const checks = [];
+    const acc = panelEl('div', 'padding:0 11px;');
+    acc.append(panelEl('div', 'font-size:11px;color:#5e6d55;margin:4px 0 2px;', 'Для кого:'));
+    if (!fit.length) acc.append(panelEl('div', 'font-size:11px;color:#9aa0a6;font-style:italic;', 'AI: нет подходящих аккаунтов — пропусти.'));
+    else for (const f of fit) {
+      const r = panelEl('label', 'display:flex;gap:7px;align-items:flex-start;cursor:pointer;margin:6px 0;');
+      const cb = document.createElement('input'); cb.type = 'checkbox'; cb.value = f.account_slug; cb.checked = (card.decision && card.decision !== 'skip'); cb.style.cssText = 'margin-top:2px;';
+      checks.push(cb);
+      const m = panelEl('div', 'flex:1;');
+      m.append(panelEl('div', 'font-weight:600;font-size:12.5px;', `${f.account_slug} · ${f.fit_score != null ? f.fit_score : '?'}`));
+      if (f.why_account) m.append(panelEl('div', 'font-size:11px;color:#5e6d55;', f.why_account));
+      if (f.risks) m.append(panelEl('div', 'font-size:10.5px;color:#b35900;', '⚠ ' + f.risks));
+      r.append(cb, m); acc.append(r);
+    }
+    detail.append(acc);
+
+    const st = panelEl('div', 'font-size:11px;color:#5e6d55;padding:4px 11px;min-height:14px;');
+    if (card.coverStatus) st.textContent = card.coverStatus;
+    const cover = panelEl('button', `margin:6px 11px 14px;width:calc(100% - 22px);background:#14a800;color:#fff;border:0;border-radius:6px;padding:9px;font-weight:600;cursor:pointer;${fit.length ? '' : 'opacity:.4;pointer-events:none;'}`, 'Cover →');
+    cover.onclick = async () => {
+      const accounts = checks.filter(c => c.checked).map(c => c.value);
+      if (accounts.length === 0) { st.textContent = 'Отметь аккаунт(ы).'; return; }
+      cover.disabled = true; cover.style.opacity = '.5'; st.textContent = `Генерю ${accounts.length}…`;
+      try {
+        const resp = await chrome.runtime.sendMessage({ type: 'APPROVE_COVERS', payload: { job_id: card.job_id, full_text: card.full_text, accounts } });
+        const rr = resp?.results || [];
+        const line = rr.map(r => `${r.account_slug}: ${r.tg_sent ? '✅' : (r.ok ? '⚠' : '❌')}`).join(' · ');
+        st.textContent = line; cover.textContent = 'Отправлено';
+        await patchCard(key, { coverStatus: line, status: 'sent' });
+        const lc = await loadCards(); const merged = lc.find(c => cardKey(c) === key); if (merged) renderListRow(merged, false);
+      } catch (e) { st.textContent = '❌ ' + (e?.message || e); cover.disabled = false; cover.style.opacity = '1'; }
+    };
+    detail.append(st, cover);
+  }
+
+  // Посмотреть: open the job (operator reviews) + run AI on demand, switch to the detail screen.
+  async function openAndAnalyze(key) {
+    const card = (await loadCards()).find(c => cardKey(c) === key);
+    if (!card) return;
+    window.open(card.url || '#', '_blank', 'noopener');   // operator sees the job
+    showDetail(key);
+    if (card.match_score == null) {
+      const r = await chrome.runtime.sendMessage({ type: 'ANALYZE_JOB', payload: {
+        upwork_id: card.upwork_id, url: card.url, title: card.title,
+        matched_skills: card.matched_skills, total_skills: card.total_skills,
+        posted_ago_min: card.posted_ago_min, client_country: card.client_country,
+      }});
+      if (!r?.ok) { await patchCard(key, { analyzeError: r?.error || 'fail' }); renderDetail(key); }
+      // on success background pushes PANEL_CARD → upsertScored → renderDetail refreshes with score+accounts
+    }
+  }
+
+  // Background pushes a SCORED card (after Analyze) → merge into storage; refresh list row + open detail.
   async function upsertScored(scored) {
     const key = scored.upwork_id || scored.job_id;
     const merged = await upsertCard({
       upwork_id: key, job_id: scored.job_id, title: scored.title, url: scored.url,
       match_score: scored.match_score, decision: scored.decision, breakdown: scored.breakdown,
       detected_tech_stack: scored.detected_tech_stack, account_fit: scored.account_fit, full_text: scored.full_text,
+      analyzeError: null,
     });
-    const body = document.getElementById(PANEL_ID + '-body');
-    const old = body && body.querySelector(`[data-ou-card="${key}"]`);
-    if (old) old.remove();
-    renderPanelCard(merged, false);
+    renderListRow(merged, false);
+    if (currentDetailKey === key) renderDetail(key);
   }
 
   async function restorePanel() {
     if (getPageType() !== 'jobs_search') return;
     ensurePanel();
     updatePanelStats();
+    showList();
     const cards = await loadCards();
-    [...cards].reverse().forEach(c => renderPanelCard(c, false));   // oldest first → newest ends on top
+    [...cards].reverse().forEach(c => renderListRow(c, false));   // oldest first → newest ends on top
     updatePanelCount();
   }
 
