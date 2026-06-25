@@ -1,5 +1,7 @@
 
-// OptimizeUp Extension v18.1.0 — Content Script
+// OptimizeUp Extension v18.1.1 — Content Script
+// v18.1.1: panel persists across auto-reload (chrome.storage); two-step flow — "Просмотр" (open job)
+//   then "Cover →" generates only on explicit click; Skip drops the card from storage.
 // v18.1.0: STEP 2B — operator panel (floating widget). Renders PANEL_CARD from background
 //   (enriched+scored job), operator ticks accounts + Approve → APPROVE_COVERS → generate_cover×N.
 //   The ONLY UI surface; dormant unless background (RADAR_BUILD) pushes cards.
@@ -917,7 +919,7 @@
     const left = panelEl('div', 'display:flex;gap:8px;align-items:center;');
     left.append(title, count);
     const clear = panelEl('button', `background:rgba(255,255,255,0.2);border:1px solid rgba(255,255,255,0.5);color:#fff;border-radius:6px;padding:2px 8px;font-size:11px;cursor:pointer;`, 'Clear');
-    clear.onclick = () => { const b = document.getElementById(PANEL_ID + '-body'); if (b) b.innerHTML = ''; updatePanelCount(); };
+    clear.onclick = () => { const b = document.getElementById(PANEL_ID + '-body'); if (b) b.innerHTML = ''; try { chrome.storage.local.set({ [PANEL_STORE_KEY]: [] }); } catch {} updatePanelCount(); };
     header.append(left, clear);
 
     const body = panelEl('div', 'overflow-y:auto;padding:8px;display:flex;flex-direction:column;gap:8px;');
@@ -934,44 +936,58 @@
     if (body && count) count.textContent = String(body.querySelectorAll('[data-ou-card]').length);
   }
 
-  function renderPanelCard(card) {
+  // Persistence — cards survive the radar's auto-reload of the search tab.
+  const PANEL_STORE_KEY = 'ou_panel_cards';
+  async function loadCards() {
+    try { const r = await chrome.storage.local.get(PANEL_STORE_KEY); return Array.isArray(r[PANEL_STORE_KEY]) ? r[PANEL_STORE_KEY] : []; }
+    catch { return []; }
+  }
+  async function saveCard(card) {
+    const cards = await loadCards();
+    if (cards.some(c => c.job_id === card.job_id)) return;
+    cards.unshift(card);
+    try { await chrome.storage.local.set({ [PANEL_STORE_KEY]: cards.slice(0, 25) }); } catch {}
+  }
+  async function patchCard(job_id, patch) {
+    const cards = await loadCards();
+    const i = cards.findIndex(c => c.job_id === job_id);
+    if (i >= 0) { cards[i] = { ...cards[i], ...patch }; try { await chrome.storage.local.set({ [PANEL_STORE_KEY]: cards }); } catch {} }
+  }
+  async function dropCard(job_id) {
+    const cards = (await loadCards()).filter(c => c.job_id !== job_id);
+    try { await chrome.storage.local.set({ [PANEL_STORE_KEY]: cards }); } catch {}
+  }
+
+  function renderPanelCard(card, persist = true) {
     ensurePanel();
     const body = document.getElementById(PANEL_ID + '-body');
     if (!body) return;
-    // de-dup: one card per job_id
-    if (body.querySelector(`[data-ou-card="${card.job_id}"]`)) return;
+    if (body.querySelector(`[data-ou-card="${card.job_id}"]`)) return;   // one card per job_id
+    if (persist) saveCard(card);
 
     const wrap = panelEl('div', `border:1px solid #e4e4e4;border-radius:8px;padding:10px;`);
     wrap.setAttribute('data-ou-card', card.job_id);
 
-    // header: score + title
     const score = card.match_score != null ? card.match_score : '?';
     const scoreColor = (card.match_score >= 70) ? '#14a800' : (card.match_score >= 50 ? '#b35900' : '#9aa0a6');
     const top = panelEl('div', 'display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-bottom:4px;');
-    const sBadge = panelEl('span', `font-weight:700;color:${scoreColor};`, `${score}/100`);
-    const dec = panelEl('span', 'font:10px/1 monospace;color:#5e6d55;text-transform:uppercase;', card.decision || '');
-    top.append(sBadge, dec);
+    top.append(panelEl('span', `font-weight:700;color:${scoreColor};`, `${score}/100`),
+               panelEl('span', 'font:10px/1 monospace;color:#5e6d55;text-transform:uppercase;', card.decision || ''));
     wrap.append(top);
 
-    const a = panelEl('a', 'display:block;font-weight:600;color:#001e00;text-decoration:none;margin-bottom:4px;');
-    a.textContent = card.title || '(untitled)';
-    a.href = card.url || '#'; a.target = '_blank'; a.rel = 'noopener';
-    wrap.append(a);
+    wrap.append(panelEl('div', 'font-weight:600;margin-bottom:4px;', card.title || '(untitled)'));
 
-    // breakdown highlights
     const b = card.breakdown || {};
-    const bits = ['niche', 'stack', 'client', 'pain', 'dach', 'market']
-      .filter(k => b[k] != null).map(k => `${k}:${b[k]}`).join('  ');
+    const bits = ['niche', 'stack', 'client', 'pain', 'dach', 'market'].filter(k => b[k] != null).map(k => `${k}:${b[k]}`).join('  ');
     if (bits) wrap.append(panelEl('div', 'font:10.5px/1.3 monospace;color:#5e6d55;margin-bottom:6px;', bits));
     if (Array.isArray(card.detected_tech_stack) && card.detected_tech_stack.length) {
       wrap.append(panelEl('div', 'font:10.5px/1.3 monospace;color:#3c8dbc;margin-bottom:6px;', card.detected_tech_stack.slice(0, 5).join(', ')));
     }
 
-    // account_fit rows with checkboxes
     const fit = Array.isArray(card.account_fit) ? card.account_fit : [];
     const checks = [];
     if (fit.length === 0) {
-      wrap.append(panelEl('div', 'font-size:12px;color:#9aa0a6;font-style:italic;margin:4px 0;', 'No account fit — skip.'));
+      wrap.append(panelEl('div', 'font-size:12px;color:#9aa0a6;font-style:italic;margin:4px 0;', 'No account fit.'));
     } else {
       const list = panelEl('div', 'display:flex;flex-direction:column;gap:5px;margin:4px 0 8px;');
       for (const f of fit) {
@@ -980,9 +996,7 @@
         cb.style.cssText = 'margin-top:2px;'; cb.checked = (card.decision && card.decision !== 'skip');
         checks.push(cb);
         const meta = panelEl('div', 'flex:1;');
-        const head = panelEl('div', 'font-weight:600;',
-          `${f.account_slug} · ${f.fit_score != null ? f.fit_score : '?'}`);
-        meta.append(head);
+        meta.append(panelEl('div', 'font-weight:600;', `${f.account_slug} · ${f.fit_score != null ? f.fit_score : '?'}`));
         if (f.why_account) meta.append(panelEl('div', 'font-size:11px;color:#5e6d55;', f.why_account));
         if (f.risks) meta.append(panelEl('div', 'font-size:10.5px;color:#b35900;', '⚠ ' + f.risks));
         row.append(cb, meta);
@@ -991,36 +1005,48 @@
       wrap.append(list);
     }
 
-    // actions
     const status = panelEl('div', 'font-size:11px;color:#5e6d55;margin-top:6px;min-height:14px;');
-    const actions = panelEl('div', 'display:flex;gap:8px;margin-top:4px;');
-    const approve = panelEl('button', `flex:1;background:#14a800;color:#fff;border:0;border-radius:6px;padding:7px;
-      font-weight:600;cursor:pointer;${fit.length ? '' : 'opacity:.4;pointer-events:none;'}`, 'Approve');
-    const skip = panelEl('button', `background:#f2f2f2;border:1px solid #d5d5d5;border-radius:6px;padding:7px 12px;cursor:pointer;`, 'Skip');
+    if (card.coverStatus) status.textContent = card.coverStatus;   // restored after reload
 
-    skip.onclick = () => { wrap.remove(); updatePanelCount(); };
-    approve.onclick = async () => {
+    // Step 1: Review — open the real job page so the operator reads it before spending on a cover.
+    const openBtn = panelEl('button', `flex:1;background:#fff;border:1px solid #14a800;color:#14a800;border-radius:6px;padding:7px;font-weight:600;cursor:pointer;`, '👁 Просмотр');
+    openBtn.onclick = () => { window.open(card.url || '#', '_blank', 'noopener'); patchCard(card.job_id, { reviewed: true }); openBtn.textContent = '👁 Открыто'; };
+
+    // Step 2: Cover — generate cover(s) ONLY by explicit click, for ticked accounts.
+    const coverBtn = panelEl('button', `flex:1;background:#14a800;color:#fff;border:0;border-radius:6px;padding:7px;font-weight:600;cursor:pointer;${fit.length ? '' : 'opacity:.4;pointer-events:none;'}`, 'Cover →');
+    coverBtn.onclick = async () => {
       const accounts = checks.filter(c => c.checked).map(c => c.value);
-      if (accounts.length === 0) { status.textContent = 'Tick at least one account, or Skip.'; return; }
-      approve.disabled = true; approve.style.opacity = '.5'; status.textContent = `Sending ${accounts.length}…`;
+      if (accounts.length === 0) { status.textContent = 'Отметь аккаунт(ы) или Skip.'; return; }
+      coverBtn.disabled = true; coverBtn.style.opacity = '.5'; status.textContent = `Генерю ${accounts.length}…`;
       try {
-        const resp = await chrome.runtime.sendMessage({
-          type: 'APPROVE_COVERS',
-          payload: { job_id: card.job_id, full_text: card.full_text, accounts },
-        });
+        const resp = await chrome.runtime.sendMessage({ type: 'APPROVE_COVERS', payload: { job_id: card.job_id, full_text: card.full_text, accounts } });
         const results = resp?.results || [];
-        status.textContent = results.map(r => `${r.account_slug}: ${r.tg_sent ? '✅ sent' : (r.ok ? '⚠ no TG' : '❌ ' + (r.error || 'fail'))}`).join('  ·  ');
-        approve.textContent = 'Done';
+        const line = results.map(r => `${r.account_slug}: ${r.tg_sent ? '✅' : (r.ok ? '⚠ no TG' : '❌')}`).join('  ·  ');
+        status.textContent = line; coverBtn.textContent = 'Готово';
+        patchCard(card.job_id, { coverStatus: line });
       } catch (e) {
         status.textContent = '❌ ' + (e?.message || e);
-        approve.disabled = false; approve.style.opacity = '1';
+        coverBtn.disabled = false; coverBtn.style.opacity = '1';
       }
     };
 
-    actions.append(approve, skip);
-    wrap.append(actions, status);
+    const skip = panelEl('button', `background:#f2f2f2;border:1px solid #d5d5d5;border-radius:6px;padding:7px 12px;cursor:pointer;`, 'Skip');
+    skip.onclick = () => { wrap.remove(); dropCard(card.job_id); updatePanelCount(); };
+
+    const row1 = panelEl('div', 'display:flex;gap:8px;margin-top:4px;');
+    row1.append(openBtn, skip);
+    const row2 = panelEl('div', 'display:flex;gap:8px;margin-top:6px;');
+    row2.append(coverBtn);
+    wrap.append(row1, row2, status);
     body.prepend(wrap);   // newest on top
     updatePanelCount();
+  }
+
+  async function restorePanel() {
+    if (getPageType() !== 'jobs_search') return;
+    const cards = await loadCards();
+    if (!cards.length) return;
+    [...cards].reverse().forEach(c => renderPanelCard(c, false));   // oldest first → newest ends on top
   }
 
   chrome.runtime.onMessage.addListener((msg) => {
@@ -1028,6 +1054,9 @@
       try { renderPanelCard(msg.payload); } catch (e) { warn('panel render fail:', e?.message); }
     }
   });
+
+  // Re-render persisted cards after the auto-reload wipes the page DOM.
+  setTimeout(() => { restorePanel().catch(() => {}); }, 1500);
 
   log('✅ Content script loaded v' + EXT_VERSION);
 })();
