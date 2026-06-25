@@ -1,8 +1,9 @@
 
-// OptimizeUp Extension v18.3.0 — Content Script
+// OptimizeUp Extension v18.4.0 — Content Script
+// v18.4.0: detail panel now lives ON the job page. Посмотреть (feed) opens the job tab; that tab
+//   shows the detail (AI verdict + accounts + Cover + ← Закрыть) via initJobDetailPanel + triggers AI.
+//   Search tab stays the feed. Scored updates broadcast to all upwork tabs.
 // v18.3.0: two-screen panel. SCREEN 1 = feed (score/pre-score · title · [Посмотреть] · ✕), NO freelancers.
-//   Посмотреть → opens job + AI → SCREEN 2 = detail (← Назад, AI verdict, "для кого" accounts, Cover).
-//   Fixed scroll (min-height:0). Status colors persist (pending/skipped/sent).
 // v18.2.1: cheap heuristic pre-score (~NN, blue) on light cards so the feed ranks pre-AI;
 //   stats 'found' = NEW jobs (skipped+passed), not re-seen page total.
 // v18.2.0: operator-gated AI — prematch-passed jobs render as LIGHT cards (search data only, no tab/Claude).
@@ -1120,8 +1121,9 @@
     if (!card) { showList(); return; }
     detail.textContent = '';
 
-    const back = panelEl('button', 'background:#f2f2f2;border:1px solid #d5d5d5;border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer;margin:9px 9px 4px;', '← Назад к списку');
-    back.onclick = showList;
+    const onJob = getPageType() === 'job_detail';
+    const back = panelEl('button', 'background:#f2f2f2;border:1px solid #d5d5d5;border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer;margin:9px 9px 4px;', onJob ? '← Закрыть' : '← Назад к списку');
+    back.onclick = () => { if (onJob) window.close(); else showList(); };
     detail.append(back);
     detail.append(panelEl('div', 'font-weight:700;font-size:13px;padding:2px 11px 2px;', card.title || '(untitled)'));
     const openLink = panelEl('button', 'background:none;border:0;color:#3c8dbc;cursor:pointer;font-size:12px;padding:0 11px 6px;text-align:left;', '↗ открыть вакансию');
@@ -1176,20 +1178,32 @@
     detail.append(st, cover);
   }
 
-  // Посмотреть: open the job (operator reviews) + run AI on demand, switch to the detail screen.
+  const cardIdFromUrl = () => { const m = location.pathname.match(/~[\w]{12,}/); return m ? m[0] : null; };
+
+  // Посмотреть (feed): open the job in a new tab. The detail panel (AI verdict + accounts + Cover)
+  // renders ON the job page itself (initJobDetailPanel), so the operator reviews + acts in one place.
   async function openAndAnalyze(key) {
     const card = (await loadCards()).find(c => cardKey(c) === key);
     if (!card) return;
-    window.open(card.url || '#', '_blank', 'noopener');   // operator sees the job
+    window.open(card.url || '#', '_blank');
+  }
+
+  // On the job-detail page: show the detail panel for THIS job; trigger AI if not scored yet.
+  async function initJobDetailPanel() {
+    const key = cardIdFromUrl();
+    if (!key) return;
+    const card = (await loadCards()).find(c => cardKey(c) === key);
+    if (!card) return;   // not a job we routed from the radar — stay invisible
+    ensurePanel();
+    const list = document.getElementById(PANEL_ID + '-list'); if (list) list.style.display = 'none';
+    const stats = document.getElementById(PANEL_ID + '-stats'); if (stats) stats.style.display = 'none';
     showDetail(key);
     if (card.match_score == null) {
-      const r = await chrome.runtime.sendMessage({ type: 'ANALYZE_JOB', payload: {
+      chrome.runtime.sendMessage({ type: 'ANALYZE_JOB', payload: {
         upwork_id: card.upwork_id, url: card.url, title: card.title,
         matched_skills: card.matched_skills, total_skills: card.total_skills,
         posted_ago_min: card.posted_ago_min, client_country: card.client_country,
-      }});
-      if (!r?.ok) { await patchCard(key, { analyzeError: r?.error || 'fail' }); renderDetail(key); }
-      // on success background pushes PANEL_CARD → upsertScored → renderDetail refreshes with score+accounts
+      }}).then(r => { if (!r?.ok) { patchCard(key, { analyzeError: r?.error || 'fail' }).then(() => renderDetail(key)); } });
     }
   }
 
@@ -1222,8 +1236,11 @@
     }
   });
 
-  // Re-render persisted cards after the auto-reload wipes the page DOM.
-  setTimeout(() => { restorePanel().catch(() => {}); }, 1500);
+  // Restore the feed on the search page; show the detail panel on a job page we routed to.
+  setTimeout(() => {
+    if (getPageType() === 'job_detail') initJobDetailPanel().catch(() => {});
+    else restorePanel().catch(() => {});
+  }, 1500);
 
   log('✅ Content script loaded v' + EXT_VERSION);
 })();

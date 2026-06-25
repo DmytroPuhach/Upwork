@@ -1,4 +1,6 @@
-// OptimizeUp Extension v19.4.0 — Background Service Worker
+// OptimizeUp Extension v19.4.1 — Background Service Worker
+// v19.4.1: sendPanelCard broadcasts the scored card to ALL upwork tabs (search feed + the job-detail
+//   tab the operator opened — the detail panel now lives on the job page).
 // v19.4.0: operator-gated AI — removed auto enrich+score. ANALYZE_JOB opens job + enrich + score_route
 //   ONLY on operator click (reviewJob returns scoreData + pushes PANEL_CARD; forceAnalyze bypasses stale guard).
 //   prematch + peak-window + skip=silence + full_text passthrough unchanged.
@@ -530,16 +532,15 @@ async function reviewJob(item) {
 // Push an enriched+scored job to the operator panel on the search tab (radar only).
 async function sendPanelCard(card) {
   try {
-    const { scrapingTabId } = await chrome.storage.local.get('scrapingTabId');
-    let tabId = scrapingTabId;
-    if (tabId) { try { await chrome.tabs.get(tabId); } catch { tabId = null; } }
-    if (!tabId) {
-      const tabs = await chrome.tabs.query({ url: ['https://www.upwork.com/nx/search/jobs/*', 'https://www.upwork.com/nx/find-work/*'] });
-      tabId = tabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0]?.id;
+    // Broadcast to ALL upwork tabs — the search-tab feed AND the job-detail tab the operator opened
+    // both need the scored update (the detail panel lives on the job page now).
+    const tabs = await chrome.tabs.query({ url: ['https://www.upwork.com/*'] });
+    let sent = 0;
+    for (const t of tabs) {
+      if (!t.id) continue;
+      try { await chrome.tabs.sendMessage(t.id, { type: 'PANEL_CARD', payload: card }); sent++; } catch {}
     }
-    if (!tabId) { console.warn('[OU] panel: no search tab to render card'); return; }
-    await chrome.tabs.sendMessage(tabId, { type: 'PANEL_CARD', payload: card }).catch(() => {});
-    console.log(`[OU] PANEL_CARD → "${(card.title||'').substring(0,40)}" score=${card.match_score} fit=[${(card.account_fit||[]).map(f => f.account_slug + ':' + f.fit_score).join(',')}]`);
+    console.log(`[OU] PANEL_CARD → ${sent} tab(s) "${(card.title || '').substring(0, 40)}" score=${card.match_score} fit=[${(card.account_fit || []).map(f => f.account_slug + ':' + f.fit_score).join(',')}]`);
   } catch (e) { console.warn('[OU] sendPanelCard error:', e); }
 }
 

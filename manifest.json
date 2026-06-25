@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "OptimizeUp Agency Assistant",
-  "version": "19.5.0",
-  "description": "Internal agency tool for OptimizeUp team - v19.5.0 (RADAR): two-screen panel — feed (score+title+Посмотреть) → detail (AI verdict + accounts + Cover + Back).",
+  "version": "19.6.0",
+  "description": "Internal agency tool for OptimizeUp team - v19.6.0 (RADAR): detail panel lives on the job page (Посмотреть opens job → AI verdict + accounts + Cover there).",
   "permissions": ["storage", "alarms", "activeTab", "scripting", "tabs"],
   "host_permissions": [
     "https://www.upwork.com/*",
