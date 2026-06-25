@@ -1,3 +1,7 @@
+// leadgen-v2 v40 — anti multi-accounting: generate_cover now loads sibling covers already written
+//   for the SAME job by other team accounts and feeds them to Claude with "diverge hard" so the 3
+//   covers (Dima/David/Vika) don't look templated. Pairs with cover_generator_prompt_v3 (DB) edit:
+//   fake "attack angles" removed → differentiation by real standing (Top Rated / dropped-JSS / zero).
 // leadgen-v2 v39 — account_fit now returns EVERY enabled account (weak fits get a low score + risk,
 //   never omitted) so the operator always sees dima/david/vika and decides. Was: only-fits.
 // leadgen-v2 v38 — + mode:"cancel_cover" {job_id, account_slug?} → mark proposal(s) status='cancelled'
@@ -377,7 +381,7 @@ ${JSON.stringify(accountProfiles, null, 2)}`;
 }
 
 // ENDPOINT B helper: generate ONE cover on full job text. system = cover_generator_prompt_v3 + knowledge_base_v3.
-async function generateCoverClaude(fullText, account, job, sb) {
+async function generateCoverClaude(fullText, account, job, sb, siblingCovers: any[] = []) {
   const { data: rows } = await sb.from('opus_knowledge').select('key, content')
     .in('key', ['cover_generator_prompt_v3', 'knowledge_base_v3']);
   const coverPrompt = rows?.find(r => r.key === 'cover_generator_prompt_v3')?.content;
@@ -399,6 +403,13 @@ async function generateCoverClaude(fullText, account, job, sb) {
     cv: (account.cv_text || '').substring(0, 1500),
   };
 
+  // Anti multi-accounting: show what sibling team accounts already wrote for THIS job → diverge hard.
+  const siblingBlock = (Array.isArray(siblingCovers) && siblingCovers.length)
+    ? `\n\n## Каверы соседних аккаунтов на ЭТУ ЖЕ вакансию (уже написаны нашими другими аккаунтами)
+Твой кавер ОБЯЗАН быть ЯВНО другим: другой первый заход (первая строка), другой кейс из базы, другая структура и другие формулировки. НИКАКИХ совпадающих предложений или фраз. Одинаковые письма с родственных аккаунтов = палево мульти-аккаунтинга — это недопустимо.
+${siblingCovers.map(s => `--- ${s.member_slug} ---\n${String(s.proposal_text || '').substring(0, 900)}`).join('\n\n')}`
+    : '';
+
   const userMsg = `## Job (full text)
 ${(fullText || '').substring(0, 6000)}
 
@@ -406,7 +417,7 @@ ${(fullText || '').substring(0, 6000)}
 ${JSON.stringify(job.screening_questions || [])}
 
 ## Write the proposal AS this account
-${JSON.stringify(profile, null, 2)}`;
+${JSON.stringify(profile, null, 2)}${siblingBlock}`;
 
   return await callClaude(system, userMsg, sb, 'cover', 2000);
 }
@@ -634,8 +645,15 @@ async function runGenerateCover(jobId, accountSlug, fullText) {
 
     await dbg(sb, 'cover_start', { run_id: runId, job_id: jobId, account: account.slug });
 
+    // sibling covers already written for this job by OTHER team accounts → force divergence (anti multi-acct)
+    const { data: siblings } = await sb.from('proposals')
+      .select('member_slug, proposal_text')
+      .eq('job_id', jobId).neq('member_slug', account.slug)
+      .in('status', ['generated', 'sent', 'submitted']);
+    const siblingCovers = (siblings || []).filter(s => String(s.proposal_text || '').trim().length > 30);
+
     const text = (fullText && fullText.length > 50) ? fullText : (job.description || '');
-    const result = await generateCoverClaude(text, account, job, sb);
+    const result = await generateCoverClaude(text, account, job, sb, siblingCovers);
     if (result.error) {
       await dbg(sb, 'cover_claude_error', { run_id: runId, err: result.error, account: account.slug });
       return { ok: false, error: result.error };
