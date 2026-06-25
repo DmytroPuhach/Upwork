@@ -1,7 +1,9 @@
 
-// OptimizeUp Extension v18.1.2 — Content Script
-// v18.1.2: panel moved LEFT + static (always visible on search page, even empty) with stats bar
-//   (found/skipped/passed today). recordScanStats fed from handleJobCards.
+// OptimizeUp Extension v18.1.3 — Content Script
+// v18.1.3: panel = JOB FEED (compact: score+title+👁+✕, accounts/Cover on row-expand), DRAGGABLE,
+//   default bottom-right (position remembered). Statuses: pending=green, skip=struck, sent=green-struck
+//   (rows persist as a decision log, not removed). Stats bar kept.
+// v18.1.2: panel moved LEFT + static (always visible on search page, even empty) with stats bar.
 // v18.1.1: panel persists across auto-reload (chrome.storage); two-step flow — "Просмотр" (open job)
 //   then "Cover →" generates only on explicit click; Skip drops the card from storage.
 // v18.1.0: STEP 2B — operator panel (floating widget). Renders PANEL_CARD from background
@@ -908,18 +910,37 @@
     return el;
   }
 
+  // drag the panel by its header; remember position in (page) localStorage
+  function makeDraggable(panel, handle) {
+    handle.addEventListener('mousedown', (e) => {
+      if (e.target.tagName === 'BUTTON') return;
+      const rect = panel.getBoundingClientRect();
+      const offX = e.clientX - rect.left, offY = e.clientY - rect.top;
+      panel.style.right = 'auto'; panel.style.bottom = 'auto';
+      const move = (ev) => { panel.style.left = Math.max(0, ev.clientX - offX) + 'px'; panel.style.top = Math.max(0, ev.clientY - offY) + 'px'; };
+      const up = () => {
+        document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up);
+        try { localStorage.setItem('ou_panel_pos', JSON.stringify({ left: parseInt(panel.style.left), top: parseInt(panel.style.top) })); } catch {}
+      };
+      document.addEventListener('mousemove', move); document.addEventListener('mouseup', up);
+      e.preventDefault();
+    });
+  }
+
   function ensurePanel() {
     let panel = document.getElementById(PANEL_ID);
     if (panel) return panel;
-    // Static, always-visible, LEFT side (Upwork's left nav is unused for us).
-    panel = panelEl('div', `position:fixed;left:12px;top:90px;width:330px;max-height:80vh;z-index:2147483647;
+    // Movable feed widget — default bottom-right.
+    panel = panelEl('div', `position:fixed;width:320px;max-height:78vh;z-index:2147483647;
       background:#fff;border:1px solid #d5d5d5;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.18);
       font:13px/1.4 -apple-system,Segoe UI,Roboto,sans-serif;color:#001e00;display:flex;flex-direction:column;overflow:hidden;`);
     panel.id = PANEL_ID;
+    panel.style.right = '16px'; panel.style.bottom = '16px';
+    try { const pos = JSON.parse(localStorage.getItem('ou_panel_pos') || 'null'); if (pos && pos.left != null) { panel.style.left = pos.left + 'px'; panel.style.top = pos.top + 'px'; panel.style.right = 'auto'; panel.style.bottom = 'auto'; } } catch {}
 
-    const header = panelEl('div', `display:flex;align-items:center;justify-content:space-between;padding:9px 12px;
-      background:#14a800;color:#fff;font-weight:600;cursor:default;`);
-    const title = panelEl('span', '', 'OptimizeUp Radar');
+    const header = panelEl('div', `display:flex;align-items:center;justify-content:space-between;padding:8px 11px;
+      background:#14a800;color:#fff;font-weight:600;cursor:move;user-select:none;`);
+    const title = panelEl('span', '', '⠿ Radar — fit feed');
     const count = panelEl('span', 'font:11px/1 monospace;opacity:.9;', '0');
     count.id = PANEL_ID + '-count';
     const left = panelEl('div', 'display:flex;gap:8px;align-items:center;');
@@ -928,19 +949,19 @@
     clear.onclick = () => { const b = document.getElementById(PANEL_ID + '-body'); if (b) b.innerHTML = ''; try { chrome.storage.local.set({ [PANEL_STORE_KEY]: [] }); } catch {} updatePanelCount(); };
     header.append(left, clear);
 
-    // stats bar — found / skipped / passed (today)
-    const stats = panelEl('div', 'padding:5px 12px;background:#f5f8f5;border-bottom:1px solid #e8eee8;font:11px/1.4 monospace;color:#3c4a3c;');
+    const stats = panelEl('div', 'padding:5px 11px;background:#f5f8f5;border-bottom:1px solid #e8eee8;font:11px/1.4 monospace;color:#3c4a3c;');
     stats.id = PANEL_ID + '-stats';
     stats.textContent = 'found 0 · skipped 0 · passed 0';
 
-    const body = panelEl('div', 'overflow-y:auto;padding:8px;display:flex;flex-direction:column;gap:8px;flex:1;');
+    const body = panelEl('div', 'overflow-y:auto;padding:6px;display:flex;flex-direction:column;gap:5px;flex:1;');
     body.id = PANEL_ID + '-body';
-    const empty = panelEl('div', 'padding:14px 12px;color:#9aa0a6;font-size:12px;text-align:center;', 'Waiting for scored jobs…');
+    const empty = panelEl('div', 'padding:14px 12px;color:#9aa0a6;font-size:12px;text-align:center;', 'Ждём подходящие вакансии…');
     empty.id = PANEL_ID + '-empty';
     body.append(empty);
 
     panel.append(header, stats, body);
     document.body.appendChild(panel);
+    makeDraggable(panel, header);
     return panel;
   }
 
@@ -992,86 +1013,89 @@
     try { await chrome.storage.local.set({ [PANEL_STORE_KEY]: cards }); } catch {}
   }
 
+  // Feed row: score + title + 👁 + ✕. Details (accounts/Cover) expand on row click.
+  // Status: pending = green; skipped = struck-through; sent (cover) = green struck-through.
   function renderPanelCard(card, persist = true) {
     ensurePanel();
     const body = document.getElementById(PANEL_ID + '-body');
     if (!body) return;
-    if (body.querySelector(`[data-ou-card="${card.job_id}"]`)) return;   // one card per job_id
+    if (body.querySelector(`[data-ou-card="${card.job_id}"]`)) return;   // one row per job
     if (persist) saveCard(card);
 
-    const wrap = panelEl('div', `border:1px solid #e4e4e4;border-radius:8px;padding:10px;`);
+    const wrap = panelEl('div', 'border:1px solid #e4e4e4;border-left:3px solid #14a800;border-radius:6px;overflow:hidden;');
     wrap.setAttribute('data-ou-card', card.job_id);
 
-    const score = card.match_score != null ? card.match_score : '?';
-    const scoreColor = (card.match_score >= 70) ? '#14a800' : (card.match_score >= 50 ? '#b35900' : '#9aa0a6');
-    const top = panelEl('div', 'display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-bottom:4px;');
-    top.append(panelEl('span', `font-weight:700;color:${scoreColor};`, `${score}/100`),
-               panelEl('span', 'font:10px/1 monospace;color:#5e6d55;text-transform:uppercase;', card.decision || ''));
-    wrap.append(top);
+    // ── collapsed row ──
+    const head = panelEl('div', 'display:flex;align-items:center;gap:8px;padding:6px 8px;cursor:pointer;');
+    const sc = card.match_score != null ? card.match_score : '?';
+    const scColor = (card.match_score >= 70) ? '#14a800' : (card.match_score >= 50 ? '#b35900' : '#9aa0a6');
+    const scoreBadge = panelEl('span', `font-weight:700;font-size:13px;color:${scColor};min-width:26px;text-align:center;`, String(sc));
+    const titleEl = panelEl('span', 'flex:1;font-weight:600;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;', card.title || '(untitled)');
+    const eye = panelEl('button', 'background:none;border:0;cursor:pointer;font-size:14px;padding:1px 3px;', '👁');
+    eye.title = 'Посмотреть вакансию';
+    eye.onclick = (e) => { e.stopPropagation(); window.open(card.url || '#', '_blank', 'noopener'); patchCard(card.job_id, { reviewed: true }); };
+    const skipBtn = panelEl('button', 'background:none;border:0;cursor:pointer;font-size:13px;padding:1px 3px;color:#b0b0b0;', '✕');
+    skipBtn.title = 'Отклонить';
+    head.append(scoreBadge, titleEl, eye, skipBtn);
 
-    wrap.append(panelEl('div', 'font-weight:600;margin-bottom:4px;', card.title || '(untitled)'));
-
+    // ── expandable detail (accounts + cover) ──
+    const detail = panelEl('div', 'display:none;padding:2px 9px 9px;border-top:1px solid #f0f0f0;');
     const b = card.breakdown || {};
-    const bits = ['niche', 'stack', 'client', 'pain', 'dach', 'market'].filter(k => b[k] != null).map(k => `${k}:${b[k]}`).join('  ');
-    if (bits) wrap.append(panelEl('div', 'font:10.5px/1.3 monospace;color:#5e6d55;margin-bottom:6px;', bits));
-    if (Array.isArray(card.detected_tech_stack) && card.detected_tech_stack.length) {
-      wrap.append(panelEl('div', 'font:10.5px/1.3 monospace;color:#3c8dbc;margin-bottom:6px;', card.detected_tech_stack.slice(0, 5).join(', ')));
-    }
+    const bits = ['niche', 'stack', 'client', 'pain', 'dach', 'market'].filter(k => b[k] != null).map(k => `${k}:${b[k]}`).join(' ');
+    if (bits) detail.append(panelEl('div', 'font:10px/1.3 monospace;color:#5e6d55;margin:6px 0;', bits));
 
     const fit = Array.isArray(card.account_fit) ? card.account_fit : [];
     const checks = [];
     if (fit.length === 0) {
-      wrap.append(panelEl('div', 'font-size:12px;color:#9aa0a6;font-style:italic;margin:4px 0;', 'No account fit.'));
+      detail.append(panelEl('div', 'font-size:11px;color:#9aa0a6;font-style:italic;margin:4px 0;', 'Нет подходящих аккаунтов.'));
     } else {
-      const list = panelEl('div', 'display:flex;flex-direction:column;gap:5px;margin:4px 0 8px;');
+      const list = panelEl('div', 'display:flex;flex-direction:column;gap:4px;margin:4px 0 8px;');
       for (const f of fit) {
-        const row = panelEl('label', 'display:flex;gap:7px;align-items:flex-start;cursor:pointer;');
+        const r = panelEl('label', 'display:flex;gap:6px;align-items:flex-start;cursor:pointer;');
         const cb = document.createElement('input'); cb.type = 'checkbox'; cb.value = f.account_slug;
         cb.style.cssText = 'margin-top:2px;'; cb.checked = (card.decision && card.decision !== 'skip');
         checks.push(cb);
-        const meta = panelEl('div', 'flex:1;');
-        meta.append(panelEl('div', 'font-weight:600;', `${f.account_slug} · ${f.fit_score != null ? f.fit_score : '?'}`));
-        if (f.why_account) meta.append(panelEl('div', 'font-size:11px;color:#5e6d55;', f.why_account));
-        if (f.risks) meta.append(panelEl('div', 'font-size:10.5px;color:#b35900;', '⚠ ' + f.risks));
-        row.append(cb, meta);
-        list.append(row);
+        const m = panelEl('div', 'flex:1;');
+        m.append(panelEl('div', 'font-weight:600;font-size:12px;', `${f.account_slug} · ${f.fit_score != null ? f.fit_score : '?'}`));
+        if (f.why_account) m.append(panelEl('div', 'font-size:10.5px;color:#5e6d55;', f.why_account));
+        if (f.risks) m.append(panelEl('div', 'font-size:10px;color:#b35900;', '⚠ ' + f.risks));
+        r.append(cb, m); list.append(r);
       }
-      wrap.append(list);
+      detail.append(list);
     }
 
-    const status = panelEl('div', 'font-size:11px;color:#5e6d55;margin-top:6px;min-height:14px;');
-    if (card.coverStatus) status.textContent = card.coverStatus;   // restored after reload
+    const st = panelEl('div', 'font-size:11px;color:#5e6d55;margin:4px 0;min-height:13px;');
+    if (card.coverStatus) st.textContent = card.coverStatus;
 
-    // Step 1: Review — open the real job page so the operator reads it before spending on a cover.
-    const openBtn = panelEl('button', `flex:1;background:#fff;border:1px solid #14a800;color:#14a800;border-radius:6px;padding:7px;font-weight:600;cursor:pointer;`, '👁 Просмотр');
-    openBtn.onclick = () => { window.open(card.url || '#', '_blank', 'noopener'); patchCard(card.job_id, { reviewed: true }); openBtn.textContent = '👁 Открыто'; };
+    // status styling
+    const applyStatus = (s) => {
+      if (s === 'skipped') { wrap.style.borderLeftColor = '#b0b0b0'; wrap.style.opacity = '.6'; titleEl.style.textDecoration = 'line-through'; titleEl.style.color = '#888'; }
+      else if (s === 'sent') { wrap.style.borderLeftColor = '#14a800'; wrap.style.opacity = '1'; titleEl.style.textDecoration = 'line-through'; titleEl.style.color = '#14a800'; }
+      else { wrap.style.borderLeftColor = '#14a800'; wrap.style.opacity = '1'; titleEl.style.textDecoration = 'none'; titleEl.style.color = '#001e00'; }
+    };
 
-    // Step 2: Cover — generate cover(s) ONLY by explicit click, for ticked accounts.
-    const coverBtn = panelEl('button', `flex:1;background:#14a800;color:#fff;border:0;border-radius:6px;padding:7px;font-weight:600;cursor:pointer;${fit.length ? '' : 'opacity:.4;pointer-events:none;'}`, 'Cover →');
+    const coverBtn = panelEl('button', `width:100%;background:#14a800;color:#fff;border:0;border-radius:6px;padding:7px;font-weight:600;cursor:pointer;${fit.length ? '' : 'opacity:.4;pointer-events:none;'}`, 'Cover →');
     coverBtn.onclick = async () => {
       const accounts = checks.filter(c => c.checked).map(c => c.value);
-      if (accounts.length === 0) { status.textContent = 'Отметь аккаунт(ы) или Skip.'; return; }
-      coverBtn.disabled = true; coverBtn.style.opacity = '.5'; status.textContent = `Генерю ${accounts.length}…`;
+      if (accounts.length === 0) { st.textContent = 'Отметь аккаунт(ы).'; return; }
+      coverBtn.disabled = true; coverBtn.style.opacity = '.5'; st.textContent = `Генерю ${accounts.length}…`;
       try {
         const resp = await chrome.runtime.sendMessage({ type: 'APPROVE_COVERS', payload: { job_id: card.job_id, full_text: card.full_text, accounts } });
         const results = resp?.results || [];
-        const line = results.map(r => `${r.account_slug}: ${r.tg_sent ? '✅' : (r.ok ? '⚠ no TG' : '❌')}`).join('  ·  ');
-        status.textContent = line; coverBtn.textContent = 'Готово';
-        patchCard(card.job_id, { coverStatus: line });
+        const line = results.map(r => `${r.account_slug}: ${r.tg_sent ? '✅' : (r.ok ? '⚠' : '❌')}`).join(' · ');
+        st.textContent = line; coverBtn.textContent = 'Отправлено';
+        applyStatus('sent'); patchCard(card.job_id, { coverStatus: line, status: 'sent' });
       } catch (e) {
-        status.textContent = '❌ ' + (e?.message || e);
-        coverBtn.disabled = false; coverBtn.style.opacity = '1';
+        st.textContent = '❌ ' + (e?.message || e); coverBtn.disabled = false; coverBtn.style.opacity = '1';
       }
     };
+    detail.append(st, coverBtn);
 
-    const skip = panelEl('button', `background:#f2f2f2;border:1px solid #d5d5d5;border-radius:6px;padding:7px 12px;cursor:pointer;`, 'Skip');
-    skip.onclick = () => { wrap.remove(); dropCard(card.job_id); updatePanelCount(); };
+    skipBtn.onclick = (e) => { e.stopPropagation(); applyStatus('skipped'); patchCard(card.job_id, { status: 'skipped' }); };
+    head.onclick = () => { detail.style.display = detail.style.display === 'none' ? 'block' : 'none'; };
 
-    const row1 = panelEl('div', 'display:flex;gap:8px;margin-top:4px;');
-    row1.append(openBtn, skip);
-    const row2 = panelEl('div', 'display:flex;gap:8px;margin-top:6px;');
-    row2.append(coverBtn);
-    wrap.append(row1, row2, status);
+    wrap.append(head, detail);
+    applyStatus(card.status || 'pending');
     body.prepend(wrap);   // newest on top
     updatePanelCount();
   }
