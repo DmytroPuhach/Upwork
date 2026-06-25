@@ -1,4 +1,6 @@
-// OptimizeUp Metrics v1.2.0 — Teammate-side metrics tool (content script)
+// OptimizeUp Metrics v1.3.0 — Teammate-side metrics tool (content script)
+// v1.3.0: notifications parser built (notificationsMap via bridge; proposal viewed/hired) — validated
+//   (proposal viewed_at update lands; endpoint now matches by job id). All 4 parsers live.
 // v1.2.0: connects parser built (DOM table #connects-history-table; synthesized stable txn id) — validated.
 // v1.1.0: proposals parser built (window.__NUXT__.state.lists via MAIN-world bridge) — validated, rows land.
 //
@@ -236,6 +238,36 @@
     return out;
   }
 
+  // ═══════════════════════════════════════════════════════════
+  // PARSER: /ab/notifications/  — viewed/hired events → update proposals.
+  // Data: window.__NUXT__.state["$s$pageData:notificationsMap"].{activity,job_alerts}
+  //   item: { notificationId, unread, type, timestamp(ms), text(html with job <a href>), cta }
+  // Only proposal-events matter; job id is extracted from the embedded job link.
+  // ═══════════════════════════════════════════════════════════
+  function parseNotifications(nuxt) {
+    const map = nuxt?.state?.['$s$pageData:notificationsMap'] || {};
+    const items = [].concat(map.activity || [], map.job_alerts || []);
+    const out = [];
+    for (const n of items) {
+      const text = String(n.text || '');
+      const rawType = String(n.type || '');
+      let type = null;
+      if (/viewed your (proposal|application)/i.test(text) || /proposal\/viewed/i.test(rawType)) type = 'proposal_viewed';
+      else if (/hired you|offered you|sent you an offer|accepted your proposal|you'?re hired|you are hired|hired for/i.test(text) || /hire/i.test(rawType)) type = 'hired';
+      if (!type) continue;
+      const jm = text.match(/\/jobs\/(~[\w]{10,})/) || String(n.cta?.href || '').match(/\/jobs\/(~[\w]{10,})/);
+      const tsMs = Number(n.timestamp) || null;
+      out.push({
+        notification_id: n.notificationId || null,
+        type,
+        upwork_job_id: jm ? jm[1] : null,
+        timestamp: tsMs ? new Date(tsMs < 1e12 ? tsMs * 1000 : tsMs).toISOString() : null,
+        text: text.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200),
+      });
+    }
+    return out;
+  }
+
   // ── POST helper (anon key + machine_id; no service_role) ──
   async function post(page, body) {
     const account_slug = await resolveAccountSlug();
@@ -285,20 +317,13 @@
     setStatus(r.ok ? `✅ ${r.ingested || 0} ingested (${transactions.length} rows seen)` : `❌ ${r.error || ('HTTP ' + r.http)}`);
   }
 
-  async function captureSample(page, setStatus) {
-    // First step of building a parser: dump the real Nuxt state (via MAIN-world bridge) + data-test map.
-    const bridged = await readNuxtViaBridge();
-    const stateKeys = bridged?.state ? Object.keys(bridged.state).slice(0, 80) : null;
-    const sample = {
-      page, url: location.href,
-      state_keys: stateKeys,
-      data_test: [...new Set([...document.querySelectorAll('[data-test]')].map(e => e.getAttribute('data-test')))].slice(0, 80),
-      state_sample: bridged?.state ? JSON.stringify(bridged.state).slice(0, 7000) : null,
-    };
-    const out = JSON.stringify(sample);
-    try { (navigator.clipboard && navigator.clipboard.writeText(out)); } catch {}
-    console.log('[OU metrics] SAMPLE ' + page + ':\n' + JSON.stringify(sample, null, 2));
-    setStatus('📋 Sample captured → console + clipboard. Send it to dev to build this parser.');
+  async function scanNotifications(setStatus) {
+    const nuxt = await readNuxtViaBridge();
+    const notifications = parseNotifications(nuxt);
+    if (!notifications.length) { setStatus('✅ no proposal-view/hire notifications right now'); return; }
+    setStatus(`Posting ${notifications.length}…`);
+    const r = await post('notifications', { notifications });
+    setStatus(r.ok ? `✅ ${r.updated || 0} proposal(s) updated (${notifications.length} events)` : `❌ ${r.error || ('HTTP ' + r.http)}`);
   }
 
   // ── UI: single Scan button for the current stat page ──
@@ -309,11 +334,10 @@
 
     const wrap = document.createElement('div');
     wrap.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483647;font:13px/1.4 -apple-system,Segoe UI,Roboto,sans-serif;display:flex;flex-direction:column;gap:6px;align-items:flex-end;';
-    const built = (page === 'my-stats' || page === 'proposals' || page === 'connects-history');   // parsers proven for these
     const btn = document.createElement('button');
     btn.id = 'ou-metrics-btn';
-    btn.textContent = built ? `📊 Scan ${page}` : `📋 Capture ${page} sample`;
-    btn.style.cssText = `background:${built ? '#14a800' : '#3c8dbc'};color:#fff;border:0;border-radius:8px;padding:10px 14px;font-weight:600;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.2);`;
+    btn.textContent = `📊 Scan ${page}`;
+    btn.style.cssText = `background:#14a800;color:#fff;border:0;border-radius:8px;padding:10px 14px;font-weight:600;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.2);`;
     const status = document.createElement('div');
     status.style.cssText = 'background:#fff;border:1px solid #d5d5d5;border-radius:6px;padding:6px 9px;max-width:300px;color:#001e00;box-shadow:0 2px 8px rgba(0,0,0,.12);display:none;';
     const setStatus = (t) => { status.style.display = 'block'; status.textContent = t; };
@@ -324,7 +348,7 @@
         if (page === 'my-stats') await scanMyStats(setStatus);
         else if (page === 'proposals') await scanProposals(setStatus);
         else if (page === 'connects-history') await scanConnects(setStatus);
-        else await captureSample(page, setStatus);
+        else if (page === 'notifications') await scanNotifications(setStatus);
       } catch (e) { setStatus('❌ ' + (e?.message || e)); }
       btn.disabled = false; btn.textContent = orig;
     };

@@ -32,7 +32,7 @@ injected on `/nx/search/jobs`. Keep it that way.
 | my-stats | `parseMyStats` (ported from radar, PROVEN — 62 runs) | ✅ Scan → parse → POST `/profile-sync/my-stats` (verified: row lands) |
 | proposals | `parseProposals` (`__NUXT__.state.lists` via MAIN-world bridge) | ✅ Scan → parse → POST `/profile-sync/proposals` (verified: 2 rows landed) |
 | connects-history | `parseConnectsHistory` (DOM table `#connects-history-table`) | ✅ Scan → parse → POST `/profile-sync/connects-history` (verified: rows landed in connects_ledger) |
-| notifications | — | 📋 Scan = capture live sample (0 runs ever) |
+| notifications | `parseNotifications` (`notificationsMap` via bridge) | ✅ Scan → parse → POST `/profile-sync/notifications` (verified: proposal viewed_at update landed) |
 
 Note: connects history is client-rendered (not in `__NUXT__`); parsed from the DOM table. Rows have
 no stable txn id and can be identical, so the id is synthesized `${dateISO}#${action}#${delta}#${seq}`
@@ -42,8 +42,9 @@ Reading `window.__NUXT__` (live object) requires `scripts/nuxt-bridge.js` (a rea
 content script) because the isolated content script can't see page globals. my-stats uses the
 `__NUXT_DATA__` script literal directly (no bridge needed).
 
-The three missing parsers are built **one at a time**: capture live DOM/Nuxt sample →
-write parser against the REAL current shape → verify a row lands → next. No blind writes.
+All four parsers were built **one at a time** against captured live DOM/Nuxt samples and each
+verified to land a row before moving on (no blind writes). notifications updates `proposals`
+(viewed_at/hired_at), matched by job id (jobs.upwork_job_id → proposals.job_id).
 
 ## Flow
 `operator opens stat page → clicks Scan → metrics.js reads page → POST (anon key +

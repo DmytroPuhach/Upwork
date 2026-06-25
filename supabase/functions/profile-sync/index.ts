@@ -1,4 +1,6 @@
-// profile-sync v4
+// profile-sync v5
+// v5: notifications matching fixed — match proposal by job id (jobs.upwork_job_id → proposals.job_id),
+//     url-ilike fallback (old url match never worked). DEPLOY WITH --no-verify-jwt.
 // v4: fix my-stats 500 — accounts.jss_current write used .eq().catch() (invalid in supabase-js v2).
 //     Now await + try/catch. DEPLOY WITH --no-verify-jwt (extension posts without auth header).
 // v3: + /notifications route (DOM-scraped viewed/hired events from /ab/notifications/);
@@ -263,14 +265,21 @@ async function handleNotifications(body: any) {
     if (!n.upwork_job_id || !n.timestamp) continue;
     if (n.type !== 'proposal_viewed' && n.type !== 'hired') continue;
 
-    // Find the proposal by matching job URL pattern — proposals.upwork_proposal_url contains the job URL
-    const jobIdClean = String(n.upwork_job_id).replace(/^~/, '');
-    const { data: proposal } = await db.from('proposals')
-      .select('id, viewed_at, hired_at')
-      .eq('account_id', acc.id)
-      .ilike('upwork_proposal_url', `%~${jobIdClean}%`)
-      .maybeSingle();
-
+    // v5: match by job id — notification's job → jobs.upwork_job_id → proposals.job_id (this account).
+    // (Old url-ilike never matched: synced/generated proposals don't carry the job id in their url.)
+    let proposal: any = null;
+    const { data: job } = await db.from('jobs').select('id').eq('upwork_job_id', n.upwork_job_id).maybeSingle();
+    if (job) {
+      const { data: p } = await db.from('proposals')
+        .select('id, viewed_at, hired_at').eq('account_id', acc.id).eq('job_id', job.id).maybeSingle();
+      if (p) proposal = p;
+    }
+    if (!proposal) {
+      const jobIdClean = String(n.upwork_job_id).replace(/^~/, '');
+      const { data: p2 } = await db.from('proposals')
+        .select('id, viewed_at, hired_at').eq('account_id', acc.id).ilike('upwork_proposal_url', `%${jobIdClean}%`).maybeSingle();
+      if (p2) proposal = p2;
+    }
     if (!proposal) continue;
 
     const patch: Record<string, unknown> = {};

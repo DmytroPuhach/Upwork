@@ -14,7 +14,7 @@
       const N = window.__NUXT__;
       if (N && N.state) {
         try { payload = JSON.stringify({ state: N.state }); }
-        catch { try { payload = JSON.stringify({ state: { lists: N.state.lists, connects: N.state.connects } }); } catch {} }
+        catch { try { payload = JSON.stringify({ state: { lists: N.state.lists, connects: N.state.connects, ['$s$pageData:notificationsMap']: N.state['$s$pageData:notificationsMap'] } }); } catch {} }
       }
     } catch {}
     document.dispatchEvent(new CustomEvent('OU_NUXT', { detail: payload }));
