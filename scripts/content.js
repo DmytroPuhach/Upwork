@@ -1,5 +1,8 @@
 
-// OptimizeUp Extension v18.0.9 — Content Script
+// OptimizeUp Extension v18.1.0 — Content Script
+// v18.1.0: STEP 2B — operator panel (floating widget). Renders PANEL_CARD from background
+//   (enriched+scored job), operator ticks accounts + Approve → APPROVE_COVERS → generate_cover×N.
+//   The ONLY UI surface; dormant unless background (RADAR_BUILD) pushes cards.
 // v18.0.9: fixed-price budget amount from [data-test="is-fixed-price"] (job-type-label has type only
 //   for fixed); combined with job-type-label so parseBudget gets the amount without raw_text pollution.
 // v18.0.8: JOB_STRATEGIES collapsed to ONE strategy (data-test="JobTile") — removed dead testid +
@@ -881,6 +884,150 @@
   } else {
     window.addEventListener('DOMContentLoaded', () => setTimeout(() => { startObserving(); debouncedRun(); }, 2000));
   }
+
+  // ═══════════════════════════════════════════════════════════
+  // OPERATOR PANEL (2B) — radar-only floating widget.
+  // Renders a card per enriched+scored job (PANEL_CARD from background).
+  // Operator ticks accounts + Approve → background runs generate_cover per account.
+  // This is the ONLY UI surface in the system. Dormant unless background pushes cards
+  // (background only does so on RADAR_BUILD), so it never activates on teammate machines.
+  // ═══════════════════════════════════════════════════════════
+  const PANEL_ID = 'ou-operator-panel';
+
+  function panelEl(tag, style, text) {
+    const el = document.createElement(tag);
+    if (style) el.style.cssText = style;
+    if (text != null) el.textContent = text;
+    return el;
+  }
+
+  function ensurePanel() {
+    let panel = document.getElementById(PANEL_ID);
+    if (panel) return panel;
+    panel = panelEl('div', `position:fixed;right:16px;bottom:16px;width:370px;max-height:82vh;z-index:2147483647;
+      background:#fff;border:1px solid #d5d5d5;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.18);
+      font:13px/1.4 -apple-system,Segoe UI,Roboto,sans-serif;color:#001e00;display:flex;flex-direction:column;overflow:hidden;`);
+    panel.id = PANEL_ID;
+
+    const header = panelEl('div', `display:flex;align-items:center;justify-content:space-between;padding:9px 12px;
+      background:#14a800;color:#fff;font-weight:600;cursor:default;`);
+    const title = panelEl('span', '', 'OptimizeUp Radar');
+    const count = panelEl('span', 'font:11px/1 monospace;opacity:.9;', '0');
+    count.id = PANEL_ID + '-count';
+    const left = panelEl('div', 'display:flex;gap:8px;align-items:center;');
+    left.append(title, count);
+    const clear = panelEl('button', `background:rgba(255,255,255,0.2);border:1px solid rgba(255,255,255,0.5);color:#fff;border-radius:6px;padding:2px 8px;font-size:11px;cursor:pointer;`, 'Clear');
+    clear.onclick = () => { const b = document.getElementById(PANEL_ID + '-body'); if (b) b.innerHTML = ''; updatePanelCount(); };
+    header.append(left, clear);
+
+    const body = panelEl('div', 'overflow-y:auto;padding:8px;display:flex;flex-direction:column;gap:8px;');
+    body.id = PANEL_ID + '-body';
+
+    panel.append(header, body);
+    document.body.appendChild(panel);
+    return panel;
+  }
+
+  function updatePanelCount() {
+    const body = document.getElementById(PANEL_ID + '-body');
+    const count = document.getElementById(PANEL_ID + '-count');
+    if (body && count) count.textContent = String(body.querySelectorAll('[data-ou-card]').length);
+  }
+
+  function renderPanelCard(card) {
+    ensurePanel();
+    const body = document.getElementById(PANEL_ID + '-body');
+    if (!body) return;
+    // de-dup: one card per job_id
+    if (body.querySelector(`[data-ou-card="${card.job_id}"]`)) return;
+
+    const wrap = panelEl('div', `border:1px solid #e4e4e4;border-radius:8px;padding:10px;`);
+    wrap.setAttribute('data-ou-card', card.job_id);
+
+    // header: score + title
+    const score = card.match_score != null ? card.match_score : '?';
+    const scoreColor = (card.match_score >= 70) ? '#14a800' : (card.match_score >= 50 ? '#b35900' : '#9aa0a6');
+    const top = panelEl('div', 'display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-bottom:4px;');
+    const sBadge = panelEl('span', `font-weight:700;color:${scoreColor};`, `${score}/100`);
+    const dec = panelEl('span', 'font:10px/1 monospace;color:#5e6d55;text-transform:uppercase;', card.decision || '');
+    top.append(sBadge, dec);
+    wrap.append(top);
+
+    const a = panelEl('a', 'display:block;font-weight:600;color:#001e00;text-decoration:none;margin-bottom:4px;');
+    a.textContent = card.title || '(untitled)';
+    a.href = card.url || '#'; a.target = '_blank'; a.rel = 'noopener';
+    wrap.append(a);
+
+    // breakdown highlights
+    const b = card.breakdown || {};
+    const bits = ['niche', 'stack', 'client', 'pain', 'dach', 'market']
+      .filter(k => b[k] != null).map(k => `${k}:${b[k]}`).join('  ');
+    if (bits) wrap.append(panelEl('div', 'font:10.5px/1.3 monospace;color:#5e6d55;margin-bottom:6px;', bits));
+    if (Array.isArray(card.detected_tech_stack) && card.detected_tech_stack.length) {
+      wrap.append(panelEl('div', 'font:10.5px/1.3 monospace;color:#3c8dbc;margin-bottom:6px;', card.detected_tech_stack.slice(0, 5).join(', ')));
+    }
+
+    // account_fit rows with checkboxes
+    const fit = Array.isArray(card.account_fit) ? card.account_fit : [];
+    const checks = [];
+    if (fit.length === 0) {
+      wrap.append(panelEl('div', 'font-size:12px;color:#9aa0a6;font-style:italic;margin:4px 0;', 'No account fit — skip.'));
+    } else {
+      const list = panelEl('div', 'display:flex;flex-direction:column;gap:5px;margin:4px 0 8px;');
+      for (const f of fit) {
+        const row = panelEl('label', 'display:flex;gap:7px;align-items:flex-start;cursor:pointer;');
+        const cb = document.createElement('input'); cb.type = 'checkbox'; cb.value = f.account_slug;
+        cb.style.cssText = 'margin-top:2px;'; cb.checked = (card.decision && card.decision !== 'skip');
+        checks.push(cb);
+        const meta = panelEl('div', 'flex:1;');
+        const head = panelEl('div', 'font-weight:600;',
+          `${f.account_slug} · ${f.fit_score != null ? f.fit_score : '?'}`);
+        meta.append(head);
+        if (f.why_account) meta.append(panelEl('div', 'font-size:11px;color:#5e6d55;', f.why_account));
+        if (f.risks) meta.append(panelEl('div', 'font-size:10.5px;color:#b35900;', '⚠ ' + f.risks));
+        row.append(cb, meta);
+        list.append(row);
+      }
+      wrap.append(list);
+    }
+
+    // actions
+    const status = panelEl('div', 'font-size:11px;color:#5e6d55;margin-top:6px;min-height:14px;');
+    const actions = panelEl('div', 'display:flex;gap:8px;margin-top:4px;');
+    const approve = panelEl('button', `flex:1;background:#14a800;color:#fff;border:0;border-radius:6px;padding:7px;
+      font-weight:600;cursor:pointer;${fit.length ? '' : 'opacity:.4;pointer-events:none;'}`, 'Approve');
+    const skip = panelEl('button', `background:#f2f2f2;border:1px solid #d5d5d5;border-radius:6px;padding:7px 12px;cursor:pointer;`, 'Skip');
+
+    skip.onclick = () => { wrap.remove(); updatePanelCount(); };
+    approve.onclick = async () => {
+      const accounts = checks.filter(c => c.checked).map(c => c.value);
+      if (accounts.length === 0) { status.textContent = 'Tick at least one account, or Skip.'; return; }
+      approve.disabled = true; approve.style.opacity = '.5'; status.textContent = `Sending ${accounts.length}…`;
+      try {
+        const resp = await chrome.runtime.sendMessage({
+          type: 'APPROVE_COVERS',
+          payload: { job_id: card.job_id, full_text: card.full_text, accounts },
+        });
+        const results = resp?.results || [];
+        status.textContent = results.map(r => `${r.account_slug}: ${r.tg_sent ? '✅ sent' : (r.ok ? '⚠ no TG' : '❌ ' + (r.error || 'fail'))}`).join('  ·  ');
+        approve.textContent = 'Done';
+      } catch (e) {
+        status.textContent = '❌ ' + (e?.message || e);
+        approve.disabled = false; approve.style.opacity = '1';
+      }
+    };
+
+    actions.append(approve, skip);
+    wrap.append(actions, status);
+    body.prepend(wrap);   // newest on top
+    updatePanelCount();
+  }
+
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (msg?.type === 'PANEL_CARD' && msg.payload) {
+      try { renderPanelCard(msg.payload); } catch (e) { warn('panel render fail:', e?.message); }
+    }
+  });
 
   log('✅ Content script loaded v' + EXT_VERSION);
 })();

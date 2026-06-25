@@ -1,3 +1,4 @@
+// extension-job-enrich v9 — returns full score_route result as `score` (drives radar operator panel).
 // extension-job-enrich v8 — calls leadgen-v2 mode:"score_route" (was sync full pipeline);
 //     covers are now generated later via mode:"generate_cover" after human approval.
 // extension-job-enrich v7 — SECURITY: /outbound now authenticates caller via machine_id in
@@ -176,6 +177,7 @@ async function handleEnrich(req: Request): Promise<Response> {
   // v37: score+route only (covers are generated later, after a human approves in the panel).
   // We still call synchronously so the extension learns which accounts fit (tab management).
   let biddingAccounts: string[] = [];
+  let scoreResult: any = null;  // full score_route response → drives the radar operator panel
   try {
     const lgResp = await fetch(`${SB_URL}/functions/v1/leadgen-v2`, {
       method: 'POST',
@@ -190,8 +192,8 @@ async function handleEnrich(req: Request): Promise<Response> {
       signal: AbortSignal.timeout(90000),
     });
     if (lgResp.ok) {
-      const lgData = await lgResp.json().catch(() => ({}));
-      biddingAccounts = Array.isArray(lgData.account_fit) ? lgData.account_fit.map((f: any) => f.account_slug).filter(Boolean) : [];
+      scoreResult = await lgResp.json().catch(() => null);
+      biddingAccounts = Array.isArray(scoreResult?.account_fit) ? scoreResult.account_fit.map((f: any) => f.account_slug).filter(Boolean) : [];
     }
   } catch (_e) {
     // timeout or network — extension keeps tab open (safe default)
@@ -203,6 +205,7 @@ async function handleEnrich(req: Request): Promise<Response> {
     passed_matched_skills: Number(matched_skills) || 0,
     sq_telemetry: sqTelemetry,
     bidding_accounts: biddingAccounts,
+    score: scoreResult,   // full score_route output for the radar operator panel
   }), { status: 200, headers: { 'Content-Type': 'application/json' } });
 }
 

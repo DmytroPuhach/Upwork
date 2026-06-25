@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "OptimizeUp Agency Assistant",
-  "version": "19.2.3",
-  "description": "Internal agency tool for OptimizeUp team - v19.2.3: heartbeat logs HTTP status for connectivity diagnosis.",
+  "version": "19.3.0",
+  "description": "Internal agency tool for OptimizeUp team - v19.3.0 (RADAR): peak-window gating + operator panel (enrich→score_route→approve→generate_cover).",
   "permissions": ["storage", "alarms", "activeTab", "scripting", "tabs"],
   "host_permissions": [
     "https://www.upwork.com/*",

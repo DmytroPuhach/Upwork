@@ -1,4 +1,7 @@
-// OptimizeUp Extension v19.2.3 — Background Service Worker
+// OptimizeUp Extension v19.3.0 — Background Service Worker
+// v19.3.0: STEP 2B radar — RADAR_BUILD flag; peak-window + manual-Start + tab-focus gating on
+//   reload (jittered 45–90s); reviewJob enrich→score_route→PANEL_CARD; APPROVE_COVERS → generate_cover×N.
+//   Monitoring/enrich/panel run ONLY on the radar (RADAR_BUILD); never in the Step 3 teammate build.
 // v19.2.3: heartbeat logs HTTP status (diagnose network-fail vs server-reject for stale rows).
 // v19.2.0: detectUpworkUser — read Nuxt-serialized ~01 cipher from inline scripts (new Upwork UI).
 // v19.1.1: outbound message call now sends machine_id (server authenticates it against extension_status).
@@ -25,6 +28,13 @@ const SB_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS
 const EXT_VERSION = chrome.runtime.getManifest().version;
 
 console.log('[OU] Background loaded — version', EXT_VERSION);
+
+// ═══════════════════════════════════════════════════════════
+// RADAR_BUILD — feed monitoring + enrich + operator panel run ONLY on the radar.
+// INVARIANT: the Step 3 teammate-metrics build MUST ship with RADAR_BUILD = false
+// (or strip this file's monitoring entirely). Never run the panel on teammate machines.
+// ═══════════════════════════════════════════════════════════
+const RADAR_BUILD = true;
 
 // ═══════════════════════════════════════════════════════════
 // CONFIG — single source of truth for pipeline behaviour
@@ -172,81 +182,86 @@ async function heartbeat() {
 // AUTO-RELOAD SCHEDULER
 // ═══════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════
+// PEAK-WINDOW GATING (2B.1)
+// peak_windows live in accounts.scrape_preset.peak_windows (radar account),
+// returned inside cachedIdentity.scrape_preset by /identify.
+// Shape: [ { start: "HH:MM", end: "HH:MM", timezone: "Europe/Berlin" }, ... ]
+// ═══════════════════════════════════════════════════════════
+
+function getPeakWindows(cachedIdentity) {
+  const pw = cachedIdentity?.scrape_preset?.peak_windows;
+  return Array.isArray(pw) ? pw : [];
+}
+
+// No windows configured → always-in-window (radar still runs once Start is pressed).
+function isInPeakWindow(cachedIdentity) {
+  const windows = getPeakWindows(cachedIdentity);
+  if (windows.length === 0) return true;
+  for (const w of windows) {
+    try {
+      const tz = w.timezone || cachedIdentity?.account?.timezone || 'Europe/Berlin';
+      const parts = new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour12: false, hour: '2-digit', minute: '2-digit' }).formatToParts(new Date());
+      const nowMin = parseInt(parts.find(p => p.type === 'hour')?.value, 10) * 60 + parseInt(parts.find(p => p.type === 'minute')?.value, 10);
+      const [sh, sm] = String(w.start || '00:00').split(':').map(n => parseInt(n, 10) || 0);
+      const [eh, em] = String(w.end || '23:59').split(':').map(n => parseInt(n, 10) || 0);
+      const startMin = sh * 60 + sm, endMin = eh * 60 + em;
+      const inWin = startMin <= endMin ? (nowMin >= startMin && nowMin < endMin) : (nowMin >= startMin || nowMin < endMin);
+      if (inWin) return true;
+    } catch {}
+  }
+  return false;
+}
+
+async function isSearchTabFocused() {
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    return !!(tab && /\/nx\/(search\/jobs|find-work)/.test(tab.url || ''));
+  } catch { return false; }
+}
+
+// Single gate for all radar monitoring: Start ON + inside peak window + search tab focused.
+async function radarMonitoringStatus() {
+  if (!RADAR_BUILD) return { ok: false, reason: 'not_radar_build' };
+  const { scrapingActive, pausedUntilUpdate, cachedIdentity } = await chrome.storage.local.get(['scrapingActive', 'pausedUntilUpdate', 'cachedIdentity']);
+  if (pausedUntilUpdate) return { ok: false, reason: 'paused_for_update' };
+  if (!scrapingActive) return { ok: false, reason: 'scan_off' };
+  if (!isInPeakWindow(cachedIdentity)) return { ok: false, reason: 'outside_peak_window' };
+  if (!(await isSearchTabFocused())) return { ok: false, reason: 'search_tab_not_focused' };
+  return { ok: true };
+}
+
+const RELOAD_MIN_MS = 45000, RELOAD_MAX_MS = 90000;  // jittered reload interval
+
 async function maybeReloadUpworkTab() {
   try {
-    const { cachedIdentity, lastReloadAt, pausedUntilUpdate } = await chrome.storage.local.get([
-      'cachedIdentity', 'lastReloadAt', 'pausedUntilUpdate'
-    ]);
+    const status = await radarMonitoringStatus();
+    if (!status.ok) { console.log(`[OU] reload skip: ${status.reason}`); return; }
 
-    // Only gate on bidding enabled — no quiet hours, no scrape_settings dependency
-    if (!cachedIdentity?.member?.is_bidding_enabled) return;
-    if (pausedUntilUpdate) { console.log('[OU] reload skip: paused for update'); return; }
-
-    // Reload no more than once per 60s
-    const sinceLastReload = lastReloadAt ? (Date.now() - lastReloadAt) / 1000 : Infinity;
-    if (sinceLastReload < 60) {
-      console.log(`[OU] reload skip: last reload ${Math.round(sinceLastReload)}s ago`);
-      return;
-    }
+    const { lastReloadAt, nextReloadGapMs } = await chrome.storage.local.get(['lastReloadAt', 'nextReloadGapMs']);
+    const gap = nextReloadGapMs || RELOAD_MIN_MS;
+    const sinceLast = lastReloadAt ? (Date.now() - lastReloadAt) : Infinity;
+    if (sinceLast < gap) { console.log(`[OU] reload skip: ${Math.round(sinceLast / 1000)}s < ${Math.round(gap / 1000)}s gap`); return; }
 
     const { scrapingTabId } = await chrome.storage.local.get('scrapingTabId');
     let tab = null;
     if (scrapingTabId) {
       try {
         tab = await chrome.tabs.get(scrapingTabId);
-        if (tab && !/\/nx\/(search\/jobs|find-work)/.test(tab.url || '')) {
-          console.log('[OU] reload skip: scraping tab is no longer on search page');
-          return;
-        }
+        if (tab && !/\/nx\/(search\/jobs|find-work)/.test(tab.url || '')) { console.log('[OU] reload skip: scraping tab left search'); return; }
       } catch { tab = null; }
     }
-
     if (!tab) {
-      const tabs = await chrome.tabs.query({
-        url: ['https://www.upwork.com/nx/search/jobs/*', 'https://www.upwork.com/nx/find-work/*']
-      });
-      if (tabs.length === 0) { console.log('[OU] reload skip: no Upwork job-search tab open'); return; }
+      const tabs = await chrome.tabs.query({ url: ['https://www.upwork.com/nx/search/jobs/*', 'https://www.upwork.com/nx/find-work/*'] });
+      if (tabs.length === 0) { console.log('[OU] reload skip: no search tab'); return; }
       tab = tabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0];
     }
 
     console.log(`[OU] 🔄 Reloading tab ${tab.id}`);
     await chrome.tabs.reload(tab.id);
-    await chrome.storage.local.set({ lastReloadAt: Date.now() });
-
+    const nextGap = RELOAD_MIN_MS + Math.floor(Math.random() * (RELOAD_MAX_MS - RELOAD_MIN_MS));  // 45–90s jitter
+    await chrome.storage.local.set({ lastReloadAt: Date.now(), nextReloadGapMs: nextGap });
   } catch (e) { console.warn('[OU] maybeReloadUpworkTab error:', e); }
-}
-
-function isInQuietHours(cachedIdentity) {
-  try {
-    const tz = cachedIdentity?.account?.timezone
-            || cachedIdentity?.scrape_settings?.timezone
-            || 'UTC';
-    const qStart = cachedIdentity?.scrape_settings?.quiet_hours_start ?? 22;
-    const qEnd   = cachedIdentity?.scrape_settings?.quiet_hours_end   ?? 7;
-
-    const hourStr = new Intl.DateTimeFormat('en-US', {
-      timeZone: tz, hour12: false, hour: '2-digit'
-    }).format(new Date());
-    const hour = parseInt(hourStr, 10);
-    if (isNaN(hour)) return false;
-
-    if (qStart <= qEnd) {
-      return hour >= qStart && hour < qEnd;
-    }
-    return hour >= qStart || hour < qEnd;
-  } catch {
-    return false;
-  }
-}
-
-function getSmartIntervalSec() {
-  try {
-    const h = parseInt(new Intl.DateTimeFormat('en-US', {
-      timeZone: 'Europe/Berlin', hour12: false, hour: '2-digit'
-    }).format(new Date()), 10);
-    if (isNaN(h)) return 120;
-    return (h >= 9 && h < 23) ? 60 : 270;
-  } catch { return 120; }
 }
 
 function normalizeJobUrl(url) {
@@ -343,11 +358,13 @@ async function logEvent(status, details) {
 async function processNextCandidate() {
   if (activeJobLock) return;
 
-  const { cachedIdentity, pausedUntilUpdate } = await chrome.storage.local.get([
-    'cachedIdentity', 'pausedUntilUpdate'
+  const { cachedIdentity, pausedUntilUpdate, scrapingActive } = await chrome.storage.local.get([
+    'cachedIdentity', 'pausedUntilUpdate', 'scrapingActive'
   ]);
   if (pausedUntilUpdate) return;
-  if (!cachedIdentity?.member?.is_bidding_enabled) return;
+  // Radar: process candidates only while the operator has scanning ON.
+  if (RADAR_BUILD) { if (!scrapingActive) return; }
+  else if (!cachedIdentity?.member?.is_bidding_enabled) return;
 
   const buf = await clearStaleBuffer();
   if (buf.length === 0) return;
@@ -452,8 +469,10 @@ async function reviewJob(item) {
   }
 
   if (payload?.ok && payload.description && payload.description.length >= 200) {
-    // Stage 4: CoverGenerator — send to extension-job-enrich → leadgen-v2 (async, doesn't block scraping)
+    // Radar: enrich the job → score_route (via extension-job-enrich, which writes the enriched
+    // job to DB + returns the full score). Then push a card to the operator panel. Radar never bids.
     const { machineId, cachedIdentity } = await chrome.storage.local.get(['machineId', 'cachedIdentity']);
+    let scoreData = null;
     try {
       const res = await fetch(`${SB_URL}/functions/v1/extension-job-enrich`, {
         method: 'POST',
@@ -468,23 +487,30 @@ async function reviewJob(item) {
         }),
       });
       const data = await res.json().catch(() => ({}));
-
-      const mySlug = cachedIdentity?.member?.slug;
-      const biddingAccounts = data?.bidding_accounts;
-      const shouldBid = Array.isArray(biddingAccounts) && mySlug && biddingAccounts.includes(mySlug);
-
-      if (shouldBid) {
-        console.log(`[OU] MATCHED ${item.upwork_id} — keeping tab open for ${mySlug}`);
-        logEvent('success', { upwork_job_id: item.upwork_id, description_chars: payload.description.length, duration_ms });
-      } else {
-        console.log(`[OU] CLOSED_NOT_MATCH ${item.upwork_id} — ${mySlug} not in [${(biddingAccounts || []).join(',') || 'none'}]`);
-        if (tabId) { try { await chrome.tabs.remove(tabId); } catch {} }
-        logEvent('success', { upwork_job_id: item.upwork_id, description_chars: payload.description.length, duration_ms });
-      }
+      scoreData = data?.score || null;
+      console.log(`[OU] SCORED ${item.upwork_id} — score=${scoreData?.match_score} decision=${scoreData?.decision} fit=${(scoreData?.account_fit||[]).length}`);
+      logEvent('success', { upwork_job_id: item.upwork_id, description_chars: payload.description.length, duration_ms });
     } catch (e) {
       console.log(`[OU] ERROR ${item.upwork_id} — post_exception: ${e?.message}`);
-      if (tabId) { try { await chrome.tabs.remove(tabId); } catch {} }
       logEvent('post_failed', { upwork_job_id: item.upwork_id, error_type: 'post_exception', error_detail: String(e?.message || e), duration_ms });
+    }
+
+    // Radar never bids → always close the job tab. The panel lives on the search tab.
+    if (tabId) { try { await chrome.tabs.remove(tabId); } catch {} }
+
+    if (RADAR_BUILD && scoreData && scoreData.job_id) {
+      await sendPanelCard({
+        job_id: scoreData.job_id,
+        upwork_id: item.upwork_id,
+        title: item.title || payload.title || '',
+        url: item.url,
+        full_text: payload.description,        // pass the enriched text through (do NOT re-fetch truncated)
+        match_score: scoreData.match_score ?? null,
+        decision: scoreData.decision || null,
+        breakdown: scoreData.breakdown || {},
+        detected_tech_stack: scoreData.detected_tech_stack || [],
+        account_fit: Array.isArray(scoreData.account_fit) ? scoreData.account_fit : [],
+      });
     }
     return;
   }
@@ -492,8 +518,46 @@ async function reviewJob(item) {
   // No usable description — close tab and log
   if (tabId) { try { await chrome.tabs.remove(tabId); } catch {} }
   const errType = payload?.error_type || (payload?.description ? 'description_too_short' : 'no_description');
-  console.log(`[OU] CLOSED_NOT_MATCH ${item.upwork_id} — ${errType} (desc=${payload?.description?.length || 0})`);
+  console.log(`[OU] CLOSED ${item.upwork_id} — ${errType} (desc=${payload?.description?.length || 0})`);
   logEvent('failed', { upwork_job_id: item.upwork_id, error_type: errType, error_detail: payload?.error_detail || 'No usable description', duration_ms });
+}
+
+// Push an enriched+scored job to the operator panel on the search tab (radar only).
+async function sendPanelCard(card) {
+  try {
+    const { scrapingTabId } = await chrome.storage.local.get('scrapingTabId');
+    let tabId = scrapingTabId;
+    if (tabId) { try { await chrome.tabs.get(tabId); } catch { tabId = null; } }
+    if (!tabId) {
+      const tabs = await chrome.tabs.query({ url: ['https://www.upwork.com/nx/search/jobs/*', 'https://www.upwork.com/nx/find-work/*'] });
+      tabId = tabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0]?.id;
+    }
+    if (!tabId) { console.warn('[OU] panel: no search tab to render card'); return; }
+    await chrome.tabs.sendMessage(tabId, { type: 'PANEL_CARD', payload: card }).catch(() => {});
+    console.log(`[OU] PANEL_CARD → "${(card.title||'').substring(0,40)}" score=${card.match_score} fit=[${(card.account_fit||[]).map(f => f.account_slug + ':' + f.fit_score).join(',')}]`);
+  } catch (e) { console.warn('[OU] sendPanelCard error:', e); }
+}
+
+// Operator approved N accounts for a job → generate_cover per account → TG to each owner.
+async function handleApproveCovers(payload) {
+  const { job_id, full_text, accounts } = payload || {};
+  if (!job_id || !Array.isArray(accounts) || accounts.length === 0) return { ok: false, error: 'need job_id + accounts[]' };
+  const results = [];
+  for (const account_slug of accounts) {
+    try {
+      const res = await fetch(`${SB_URL}/functions/v1/leadgen-v2`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SB_ANON_KEY}` },
+        body: JSON.stringify({ mode: 'generate_cover', job_id, account_slug, full_text }),
+      });
+      const data = await res.json().catch(() => ({}));
+      results.push({ account_slug, ok: !!data.ok, tg_sent: !!data.tg_sent, proposal_id: data.proposal_id || null, error: data.error || null });
+      console.log(`[OU] COVER ${account_slug} job=${job_id} → ok=${!!data.ok} tg_sent=${!!data.tg_sent}`);
+    } catch (e) {
+      results.push({ account_slug, ok: false, tg_sent: false, error: String(e?.message || e) });
+    }
+  }
+  return { ok: true, results };
 }
 
 // handleJobsCandidates — Stage 2 output / Stage 3 input
@@ -573,6 +637,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     handleJobsCandidates(msg.payload).then(r => sendResponse(r)).catch(e => sendResponse({ error: String(e) }));
     return true;
   }
+  if (msg?.type === 'APPROVE_COVERS') {
+    handleApproveCovers(msg.payload).then(r => sendResponse(r)).catch(e => sendResponse({ error: String(e) }));
+    return true;
+  }
   if (msg?.type === 'GET_IDENTITY') {
     chrome.storage.local.get(['cachedIdentity', 'machineId']).then(r => sendResponse(r));
     return true;
@@ -599,11 +667,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg?.type === 'GET_SCRAPING_STATE') {
     chrome.storage.local.get(['scrapingActive', 'scrapingTabId', 'cachedIdentity'])
-      .then(r => sendResponse({
-        active: !!r.scrapingActive,
-        tabId: r.scrapingTabId || null,
-        preset: r.cachedIdentity?.scrape_preset || { query: 'seo', sort: 'recency', hourly: null }
-      }));
+      .then(r => {
+        const inPeak = isInPeakWindow(r.cachedIdentity);
+        sendResponse({
+          active: !!r.scrapingActive,
+          tabId: r.scrapingTabId || null,
+          preset: r.cachedIdentity?.scrape_preset || { query: 'seo', sort: 'recency', hourly: null },
+          radar_build: RADAR_BUILD,
+          in_peak_window: inPeak,
+          peak_windows: getPeakWindows(r.cachedIdentity),
+          peak_status: inPeak ? 'in peak window' : 'outside peak window',
+        });
+      });
     return true;
   }
   if (msg?.type === 'PROFILE_SYNC_TRIGGER') {
