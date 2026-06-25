@@ -1,5 +1,7 @@
 
-// OptimizeUp Extension v18.5.4 — Content Script
+// OptimizeUp Extension v18.5.5 — Content Script
+// v18.5.5: AI verdict = skip / no account fit → card auto-marked skipped (struck + sinks), no manual
+//   ✕ needed. Detail shows the verdict in red with ❌. (Sent cards are never auto-skipped.)
 // v18.5.4: feed number == sort key (single rank). Shown number now ALWAYS matches top→down order
 //   (was: sorted by quality+freshness but displayed quality only → looked unordered). Pre-score rank
 //   = quality + freshness decay; analyzed = AI score. 75s refreshFeed re-renders so ranks age live.
@@ -1198,8 +1200,9 @@
       return;
     }
 
-    const scColor = card.match_score >= 70 ? '#14a800' : card.match_score >= 50 ? '#b35900' : '#9aa0a6';
-    detail.append(panelEl('div', `padding:2px 11px;font-weight:700;color:${scColor};`, `AI: ${card.match_score}/100 · ${card.decision || ''}`));
+    const isBidD = ['bid_high', 'bid_medium', 'bid_low'].includes((card.decision || '').toLowerCase());
+    const scColor = !isBidD ? '#c0392b' : card.match_score >= 70 ? '#14a800' : card.match_score >= 50 ? '#b35900' : '#9aa0a6';
+    detail.append(panelEl('div', `padding:2px 11px;font-weight:700;color:${scColor};`, `${isBidD ? 'AI' : '❌ AI'}: ${card.match_score}/100 · ${card.decision || 'skip'}`));
     const b = card.breakdown || {};
     const bits = ['niche', 'stack', 'client', 'pain', 'dach', 'market'].filter(k => b[k] != null).map(k => `${k}:${b[k]}`).join(' ');
     if (bits) detail.append(panelEl('div', 'font:10px/1.3 monospace;color:#5e6d55;padding:2px 11px 6px;', bits));
@@ -1323,12 +1326,18 @@
   // Background pushes a SCORED card (after Analyze) → merge into storage; refresh list row + open detail.
   async function upsertScored(scored) {
     const key = scored.upwork_id || scored.job_id;
-    const merged = await upsertCard({
+    const isBid = ['bid_high', 'bid_medium', 'bid_low'].includes((scored.decision || '').toLowerCase());
+    const fit = Array.isArray(scored.account_fit) ? scored.account_fit : [];
+    const patch = {
       upwork_id: key, job_id: scored.job_id, title: scored.title, url: scored.url,
       match_score: scored.match_score, decision: scored.decision, breakdown: scored.breakdown,
       detected_tech_stack: scored.detected_tech_stack, account_fit: scored.account_fit, full_text: scored.full_text,
       analyzeError: null,
-    });
+    };
+    // AI verdict = skip / no account fits → auto-reject the card (struck + sinks). Don't undo a sent one.
+    const existing = (await loadCards()).find(c => cardKey(c) === key);
+    if ((!isBid || fit.length === 0) && existing?.status !== 'sent') patch.status = 'skipped';
+    const merged = await upsertCard(patch);
     renderListRow(merged, false);
     if (currentDetailKey === key) renderDetail(key);
   }

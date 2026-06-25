@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "OptimizeUp Agency Assistant",
-  "version": "19.7.4",
-  "description": "Internal agency tool for OptimizeUp team - v19.7.4 (RADAR): feed number == sort order (rank); ↻ С нуля full-refresh; expandable rows; reliable job-open via SW.",
+  "version": "19.7.5",
+  "description": "Internal agency tool for OptimizeUp team - v19.7.5 (RADAR): AI 'skip' verdict auto-rejects the card; feed number == sort order; ↻ С нуля full-refresh; expandable rows.",
   "permissions": ["storage", "alarms", "activeTab", "scripting", "tabs"],
   "host_permissions": [
     "https://www.upwork.com/*",
