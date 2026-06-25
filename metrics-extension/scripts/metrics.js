@@ -1,4 +1,5 @@
-// OptimizeUp Metrics v1.0.0 — Teammate-side metrics tool (content script)
+// OptimizeUp Metrics v1.1.0 — Teammate-side metrics tool (content script)
+// v1.1.0: proposals parser built (window.__NUXT__.state.lists via MAIN-world bridge) — validated, rows land.
 //
 // ╔══════════════════════════════════════════════════════════════════════════╗
 // ║ HARD BOUNDARY — THIS BUILD RUNS ON BIDDING ACCOUNTS (Dima/Davyd/Vasya).    ║
@@ -104,6 +105,17 @@
     return null;
   }
 
+  // proposals/connects keep data in the live window.__NUXT__ (not the __NUXT_DATA__ literal),
+  // which the isolated content script can't read — ask the MAIN-world bridge for it.
+  function readNuxtViaBridge() {
+    return new Promise((resolve) => {
+      const onData = (e) => { document.removeEventListener('OU_NUXT', onData); try { resolve(e.detail ? JSON.parse(e.detail) : null); } catch { resolve(null); } };
+      document.addEventListener('OU_NUXT', onData);
+      document.dispatchEvent(new CustomEvent('OU_GET_NUXT'));
+      setTimeout(() => { document.removeEventListener('OU_NUXT', onData); resolve(null); }, 1500);
+    });
+  }
+
   // ═══════════════════════════════════════════════════════════
   // PARSER: /nx/my-stats/  — PROVEN (62 successful runs). Kept verbatim.
   // ═══════════════════════════════════════════════════════════
@@ -144,6 +156,37 @@
     return out;
   }
 
+  // ═══════════════════════════════════════════════════════════
+  // PARSER: /nx/proposals/  — status of sent bids.
+  // Data: window.__NUXT__.state.lists.{activeList,submittedList}.items
+  //   item: { applicationUID, openingUID, title, status, terms.connectsBid,
+  //           auditDetails.createdTs, withdrawReason, declineReadon }
+  // ═══════════════════════════════════════════════════════════
+  function parseProposals(nuxt) {
+    const lists = nuxt?.state?.lists || {};
+    const out = [];
+    const add = (items, listStatus) => {
+      if (!Array.isArray(items)) return;
+      for (const p of items) {
+        const id = p.applicationUID || p.uid;
+        if (!id) continue;
+        let status = listStatus;
+        if (p.withdrawReason) status = 'withdrawn';
+        else if (p.declineReadon || p.declineReason) status = 'declined';
+        out.push({
+          upwork_proposal_id: String(id),
+          upwork_proposal_url: `https://www.upwork.com/nx/proposals/${id}/`,
+          status,
+          sent_at: p.auditDetails?.createdTs || p.ctime || null,
+          connects_used: (p.terms && typeof p.terms.connectsBid === 'number') ? p.terms.connectsBid : null,
+        });
+      }
+    };
+    add(lists.activeList?.items, 'active');       // client engaged (interview/messaging)
+    add(lists.submittedList?.items, 'submitted'); // sent, awaiting response
+    return out;
+  }
+
   // ── POST helper (anon key + machine_id; no service_role) ──
   async function post(page, body) {
     const account_slug = await resolveAccountSlug();
@@ -176,17 +219,24 @@
     setStatus(r.ok ? `✅ saved (jss=${stats.jss ?? '?'}, sent7d=${stats.proposals_sent_7d ?? '?'})` : `❌ ${r.error || ('HTTP ' + r.http)}`);
   }
 
-  function captureSample(page, setStatus) {
-    // First step of building a parser: dump the real Nuxt3 state + a data-test map.
-    const rawData = readNuxt3DataFromPage();
-    const hydrated = hydrateNuxt3(rawData);
+  async function scanProposals(setStatus) {
+    const nuxt = await readNuxtViaBridge();
+    const proposals = parseProposals(nuxt);
+    if (!proposals.length) { setStatus('❌ no proposals in page state (open /nx/proposals and let it load)'); return; }
+    setStatus(`Posting ${proposals.length}…`);
+    const r = await post('proposals', { proposals });
+    setStatus(r.ok ? `✅ ${r.ingested || 0} new / ${r.updated || 0} updated (${proposals.length} bids)` : `❌ ${r.error || ('HTTP ' + r.http)}`);
+  }
+
+  async function captureSample(page, setStatus) {
+    // First step of building a parser: dump the real Nuxt state (via MAIN-world bridge) + data-test map.
+    const bridged = await readNuxtViaBridge();
+    const stateKeys = bridged?.state ? Object.keys(bridged.state).slice(0, 80) : null;
     const sample = {
       page, url: location.href,
-      nuxt3_present: !!rawData,
-      hydrated_top_keys: hydrated && typeof hydrated === 'object' ? Object.keys(hydrated).slice(0, 60) : null,
-      nuxt_global_keys: (window.__NUXT__ && typeof window.__NUXT__ === 'object') ? Object.keys(window.__NUXT__).slice(0, 40) : null,
+      state_keys: stateKeys,
       data_test: [...new Set([...document.querySelectorAll('[data-test]')].map(e => e.getAttribute('data-test')))].slice(0, 80),
-      hydrated_sample: hydrated ? JSON.stringify(hydrated).slice(0, 6000) : null,
+      state_sample: bridged?.state ? JSON.stringify(bridged.state).slice(0, 7000) : null,
     };
     const out = JSON.stringify(sample);
     try { (navigator.clipboard && navigator.clipboard.writeText(out)); } catch {}
@@ -202,7 +252,7 @@
 
     const wrap = document.createElement('div');
     wrap.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483647;font:13px/1.4 -apple-system,Segoe UI,Roboto,sans-serif;display:flex;flex-direction:column;gap:6px;align-items:flex-end;';
-    const built = page === 'my-stats';
+    const built = (page === 'my-stats' || page === 'proposals');   // parsers proven for these
     const btn = document.createElement('button');
     btn.id = 'ou-metrics-btn';
     btn.textContent = built ? `📊 Scan ${page}` : `📋 Capture ${page} sample`;
@@ -215,7 +265,8 @@
       btn.disabled = true; const orig = btn.textContent; btn.textContent = '…';
       try {
         if (page === 'my-stats') await scanMyStats(setStatus);
-        else captureSample(page, setStatus);
+        else if (page === 'proposals') await scanProposals(setStatus);
+        else await captureSample(page, setStatus);
       } catch (e) { setStatus('❌ ' + (e?.message || e)); }
       btn.disabled = false; btn.textContent = orig;
     };

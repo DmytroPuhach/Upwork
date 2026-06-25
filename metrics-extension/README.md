@@ -29,10 +29,14 @@ injected on `/nx/search/jobs`. Keep it that way.
 ## Status
 | Page | Parser | State |
 |---|---|---|
-| my-stats | `parseMyStats` (ported from radar, PROVEN — 62 runs) | ✅ Scan → parse → POST `/profile-sync/my-stats` |
-| proposals | — | 📋 Scan = capture live sample (parser not built; never worked before) |
+| my-stats | `parseMyStats` (ported from radar, PROVEN — 62 runs) | ✅ Scan → parse → POST `/profile-sync/my-stats` (verified: row lands) |
+| proposals | `parseProposals` (`__NUXT__.state.lists` via MAIN-world bridge) | ✅ Scan → parse → POST `/profile-sync/proposals` (verified: 2 rows landed) |
 | connects-history | — | 📋 Scan = capture live sample (connects_ledger empty since creation) |
 | notifications | — | 📋 Scan = capture live sample (0 runs ever) |
+
+Reading `window.__NUXT__` (live object) requires `scripts/nuxt-bridge.js` (a read-only MAIN-world
+content script) because the isolated content script can't see page globals. my-stats uses the
+`__NUXT_DATA__` script literal directly (no bridge needed).
 
 The three missing parsers are built **one at a time**: capture live DOM/Nuxt sample →
 write parser against the REAL current shape → verify a row lands → next. No blind writes.
