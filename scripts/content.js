@@ -1,5 +1,7 @@
 
-// OptimizeUp Extension v18.2.0 — Content Script
+// OptimizeUp Extension v18.2.1 — Content Script
+// v18.2.1: cheap heuristic pre-score (~NN, blue) on light cards so the feed ranks pre-AI;
+//   stats 'found' = NEW jobs (skipped+passed), not re-seen page total.
 // v18.2.0: operator-gated AI — prematch-passed jobs render as LIGHT cards (search data only, no tab/Claude).
 //   🔍 Analyze → ANALYZE_JOB → background opens job + enrich + score → row upgrades to scored (accounts+Cover).
 //   Keyed by upwork_id. No more auto JOBS_CANDIDATES pipeline.
@@ -556,6 +558,32 @@
     return { action: 'enqueue' };
   }
 
+  // Cheap heuristic pre-score (0-100) from SEARCH-CARD data only — NO AI, NO cost.
+  // Ranks the light feed so the operator sees which jobs to Analyze first.
+  // This is NOT the AI score; it's replaced by the real match_score after Analyze.
+  function prematchScore(j) {
+    let s = 40;
+    const matched = Number(j.matched_skills) || 0, total = Number(j.total_skills) || 0;
+    if (total > 0) s += Math.round((matched / total) * 25);                 // skill overlap → +25
+    const txt = ((j.title || '') + ' ' + (j.skills || []).join(' ')).toLowerCase();
+    if (/\bseo\b|audit|technical seo|on[-\s]page|local seo|gmb|google business|schema|\bgeo\b|ai search|aeo|core web vitals|search console/.test(txt)) s += 12;
+    if (/\b(writer|copywriter|content writer|article)\b/.test(txt)) s -= 12; // pure content = off-core
+    const spent = Number(j.client_spent_rough) || 0;
+    if (spent >= 10000) s += 14; else if (spent >= 1000) s += 7; else if (spent === 0) s -= 6;
+    const rating = Number(j.client_rating);
+    if (rating >= 4.8) s += 6; else if (rating > 0 && rating < 3) s -= 10;
+    if (j.payment_verified === true) s += 5; else if (j.payment_verified === false) s -= 5;
+    const pm = j.proposals_min;
+    if (pm != null) { if (pm < 5) s += 10; else if (pm < 10) s += 4; else if (pm >= 20) s -= 12; }
+    const bm = Number(j.budget_max);
+    if (!isNaN(bm) && bm > 0) {
+      if ((j.budget_type === 'hourly' && bm >= 25) || (j.budget_type === 'fixed' && bm >= 100)) s += 6;
+      else if (bm < 15) s -= 8;
+    }
+    if (j.posted_ago_min != null && j.posted_ago_min <= 30) s += 6;
+    return Math.max(0, Math.min(100, s));
+  }
+
   const JOB_STRATEGIES = [
     {
       // v18.0.7: current Upwork (Nuxt) search UI — cards are <article data-test="JobTile">.
@@ -793,8 +821,8 @@
           skippedByPrematch.map(s => s.reason).join(', '));
       }
 
-      // panel stats: detected on this scan / prematch-skipped / passed to enrichment
-      recordScanStats(result.elements.length, skippedByPrematch.length, newJobs.length);
+      // panel stats: NEW jobs this scan (skipped + passed) — not the re-seen page total
+      recordScanStats(skippedByPrematch.length + newJobs.length, skippedByPrematch.length, newJobs.length);
 
       if (newJobs.length > 0) {
         log(`💼 ${newJobs.length} new jobs via ${result.strategy} (after prematch)`);
@@ -813,11 +841,13 @@
             client_country: j.client_country,
             client_rating: j.client_rating,
             client_spent_rough: j.client_spent_rough,
+            payment_verified: j.payment_verified,
             proposals_min: j.proposals_min,
             skills: j.skills,
             matched_skills: j.matched_skills,
             total_skills: j.total_skills,
             posted_ago_min: j.posted_ago_min,
+            prematch_score: prematchScore(j),
             status: 'pending',
           });
         }
@@ -1032,8 +1062,13 @@
 
     // ── collapsed row ──
     const head = panelEl('div', 'display:flex;align-items:center;gap:6px;padding:6px 8px;cursor:pointer;');
-    const scColor = !analyzed ? '#9aa0a6' : (card.match_score >= 70 ? '#14a800' : card.match_score >= 50 ? '#b35900' : '#9aa0a6');
-    const scoreBadge = panelEl('span', `font-weight:700;font-size:13px;color:${scColor};min-width:24px;text-align:center;`, analyzed ? String(card.match_score) : '—');
+    // AI score (green tiers) once analyzed; otherwise the cheap pre-score "~NN" (blue = heuristic).
+    const scColor = analyzed
+      ? (card.match_score >= 70 ? '#14a800' : card.match_score >= 50 ? '#b35900' : '#9aa0a6')
+      : (card.prematch_score != null ? '#3c8dbc' : '#9aa0a6');
+    const scoreText = analyzed ? String(card.match_score) : (card.prematch_score != null ? '~' + card.prematch_score : '—');
+    const scoreBadge = panelEl('span', `font-weight:700;font-size:13px;color:${scColor};min-width:26px;text-align:center;`, scoreText);
+    scoreBadge.title = analyzed ? 'AI score' : 'pre-score (эвристика по карточке, до AI)';
     const titleEl = panelEl('span', 'flex:1;font-weight:600;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;', card.title || '(untitled)');
     const eye = panelEl('button', 'background:none;border:0;cursor:pointer;font-size:14px;padding:1px 3px;', '👁');
     eye.title = 'Открыть вакансию';
