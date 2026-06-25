@@ -1,5 +1,9 @@
 
-// OptimizeUp Extension v18.5.1 — Content Script
+// OptimizeUp Extension v18.5.2 — Content Script
+// v18.5.2: feed row = [▸ chevron][score][title][✕]; chevron/score/title EXPAND the row → detail
+//   (AI annotation + «для кого» + Cover, or pre-score breakdown if not analyzed yet). Removed the
+//   broken "Посмотреть" button. Opening the real job now goes through the SW (OPEN_JOB_TAB) because
+//   content-script window.open is blocked on Upwork.
 // v18.5.1: feed order = quality + freshness decay (freshnessAdj) — fresh floats up, stale sinks even
 //   if high-quality; skipped sink to bottom. posted_at_ms frozen per card; 75s re-sort timer. Age
 //   removed from prematchScore (shown score = stable quality).
@@ -567,6 +571,19 @@
     return Math.max(0, Math.min(100, s));
   }
 
+  // One-line heuristic breakdown shown in the expanded row before AI has run.
+  function prematchBreakdown(c) {
+    const parts = [];
+    if (c.total_skills) parts.push(`skills ${c.matched_skills || 0}/${c.total_skills}`);
+    if (c.budget) parts.push(`budget ${c.budget}`);
+    if (c.proposals_min != null) parts.push(`proposals ${c.proposals_min}+`);
+    if (c.client_rating) parts.push(`rating ${c.client_rating}`);
+    if (c.client_spent_rough) parts.push(`spent ~$${c.client_spent_rough}`);
+    if (c.client_country) parts.push(c.client_country);
+    if (c.posted_ago_min != null) parts.push(`${c.posted_ago_min}m ago`);
+    return parts.join(' · ');
+  }
+
   // Recency decay used ONLY for feed ordering (not the shown score): fresh floats up, stale sinks.
   function freshnessAdj(ageMin) {
     if (ageMin == null) return -8;          // unknown age → mild sink
@@ -1081,17 +1098,18 @@
     const scColor = analyzed ? (card.match_score >= 70 ? '#14a800' : card.match_score >= 50 ? '#b35900' : '#9aa0a6') : (card.prematch_score != null ? '#3c8dbc' : '#9aa0a6');
     const scoreText = analyzed ? String(card.match_score) : (card.prematch_score != null ? '~' + card.prematch_score : '—');
 
-    const row = panelEl('div', 'display:flex;align-items:center;gap:7px;padding:6px 8px;');
-    const sb = panelEl('span', `font-weight:700;font-size:13px;color:${scColor};min-width:26px;text-align:center;`, scoreText);
+    const row = panelEl('div', 'display:flex;align-items:center;gap:6px;padding:6px 8px;');
+    const chev = panelEl('button', 'background:none;border:0;cursor:pointer;font-size:12px;color:#5e6d55;padding:2px;min-width:14px;', '▸');
+    chev.title = 'Развернуть — AI-аннотация / для кого / Cover';
+    const sb = panelEl('span', `font-weight:700;font-size:13px;color:${scColor};min-width:26px;text-align:center;cursor:pointer;`, scoreText);
     sb.title = analyzed ? 'AI score' : 'pre-score (эвристика, до AI)';
     const t = panelEl('span', 'flex:1;font-weight:600;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer;', card.title || '(untitled)');
-    const view = panelEl('button', 'background:#3c8dbc;color:#fff;border:0;border-radius:5px;padding:4px 9px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap;', 'Посмотреть');
     const x = panelEl('button', 'background:none;border:0;cursor:pointer;font-size:13px;color:#b0b0b0;padding:2px;', '✕');
     x.title = 'Отклонить';
-    const open = (e) => { if (e) e.stopPropagation(); openAndAnalyze(key); };
-    view.onclick = open; t.onclick = open;
+    const expand = (e) => { if (e) e.stopPropagation(); showDetail(key); };
+    chev.onclick = expand; sb.onclick = expand; t.onclick = expand;
     x.onclick = (e) => { e.stopPropagation(); patchCard(key, { status: 'skipped' }); styleRow(wrap, t, 'skipped'); wrap.setAttribute('data-ou-status', 'skipped'); sortListRows(); };
-    row.append(sb, t, view, x);
+    row.append(chev, sb, t, x);
     wrap.append(row);
     styleRow(wrap, t, card.status || 'pending');
     if (fresh) list.appendChild(wrap);
@@ -1144,12 +1162,21 @@
     detail.append(back);
     detail.append(panelEl('div', 'font-weight:700;font-size:13px;padding:2px 11px 2px;', card.title || '(untitled)'));
     const openLink = panelEl('button', 'background:none;border:0;color:#3c8dbc;cursor:pointer;font-size:12px;padding:0 11px 6px;text-align:left;', '↗ открыть вакансию');
-    openLink.onclick = () => window.open(card.url || '#', '_blank', 'noopener');
+    openLink.onclick = () => openJobTab(card.url);
     detail.append(openLink);
 
     if (card.match_score == null) {
-      detail.append(panelEl('div', card.analyzeError ? 'padding:12px 11px;color:#b35900;font-size:12px;' : 'padding:12px 11px;color:#3c8dbc;font-size:12px;',
-        card.analyzeError ? ('Не удалось разобрать: ' + card.analyzeError + ' — открой вручную ↗') : '🔍 AI читает вакансию…'));
+      if (card.analyzeError) {
+        detail.append(panelEl('div', 'padding:12px 11px;color:#b35900;font-size:12px;', 'Не удалось разобрать: ' + card.analyzeError + ' — открой вручную ↗'));
+      } else if (onJob) {
+        detail.append(panelEl('div', 'padding:12px 11px;color:#3c8dbc;font-size:12px;', '🔍 AI читает вакансию…'));
+      } else {
+        // search feed, not analyzed yet: show heuristic pre-score; AI runs when the job is opened.
+        detail.append(panelEl('div', 'padding:4px 11px;font-weight:700;color:#3c8dbc;', `Pre-score: ~${card.prematch_score ?? '—'}/100`));
+        const pm = prematchBreakdown(card);
+        if (pm) detail.append(panelEl('div', 'font:11px/1.5 monospace;color:#5e6d55;padding:2px 11px 8px;', pm));
+        detail.append(panelEl('div', 'padding:4px 11px 12px;color:#5e6d55;font-size:12px;', 'Это эвристика (без AI). Нажми ↗ «открыть вакансию» — AI прочитает её на странице и пришлёт вердикт + «для кого» сюда.'));
+      }
       return;
     }
 
@@ -1212,10 +1239,15 @@
 
   // Посмотреть (feed): open the job in a new tab. The detail panel (AI verdict + accounts + Cover)
   // renders ON the job page itself (initJobDetailPanel), so the operator reviews + acts in one place.
+  // Open a job tab via the SW (content-script window.open is blocked on Upwork by CSP/popup rules).
+  function openJobTab(url) {
+    if (!url) return;
+    try { chrome.runtime.sendMessage({ type: 'OPEN_JOB_TAB', url }); } catch {}
+  }
   async function openAndAnalyze(key) {
     const card = (await loadCards()).find(c => cardKey(c) === key);
     if (!card) return;
-    window.open(card.url || '#', '_blank');
+    openJobTab(card.url);
   }
 
   // Read the full description straight from THIS open job page (no extra tab → no bot footprint).

@@ -1,4 +1,6 @@
-// OptimizeUp Extension v19.6.2 — Background Service Worker
+// OptimizeUp Extension v19.6.3 — Background Service Worker
+// v19.6.3: + OPEN_JOB_TAB → chrome.tabs.create (reliable job open; content-script window.open is
+//   blocked on Upwork by CSP/popup rules).
 // v19.6.2: + CANCEL_COVER → leadgen-v2 cancel_cover (mark proposal cancelled after a sent cover).
 // v19.6.1: AI never opens tabs. ANALYZE_FROM_PAGE scores the description content.js read off the
 //   operator's OWN open job page (no enrich tab). processNextCandidate/reviewJob disabled (dead).
@@ -716,6 +718,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg?.type === 'CANCEL_COVER') {
     handleCancelCover(msg.payload).then(r => sendResponse(r)).catch(e => sendResponse({ error: String(e) }));
+    return true;
+  }
+  if (msg?.type === 'OPEN_JOB_TAB') {
+    // content-script window.open is unreliable on Upwork (CSP/popup blocker); open via the SW tabs API.
+    if (msg.url) chrome.tabs.create({ url: msg.url, active: true }).catch(e => console.warn('[OU] open tab:', e));
+    sendResponse({ ok: !!msg.url });
     return true;
   }
   if (msg?.type === 'GET_IDENTITY') {
