@@ -1,4 +1,8 @@
-// extension-config v9
+// extension-config v11
+// v11: heartbeat no longer overwrites a resolved account_slug with 'unknown' (preserves the
+//      identify machine_id-fallback anchor). DEPLOY WITH --no-verify-jwt (extension calls have no auth header).
+// v10: /identify machine_id fallback — resolve account via extension_status when page uid is missing
+//      (survives detectUpworkUser breakage from Upwork UI changes).
 // v9: SECURITY — /toggle-bidding now authenticates caller via machine_id in extension_status
 //     (anon key is public). Machine may only toggle its OWN account; body.slug ignored for auth.
 // v8: STEP 0 — secrets to Deno.env; + /toggle-bidding route (extension no longer holds service_role).
@@ -72,6 +76,20 @@ Deno.serve(async (req) => {
         }
         if (member && upwork_user_id) await sb.from('team_members').update({ upwork_user_id }).eq('id', member.id);
       }
+      // Fallback: resolve by machine_id from a prior successful identification (extension_status).
+      // Keeps a machine identified even when the page no longer exposes the Upwork uid
+      // (e.g. UI change broke detectUpworkUser). Backfills upwork_user_id if we now have one.
+      if (!member && machine_id) {
+        const { data: ext } = await sb.from('extension_status').select('account_slug').eq('machine_id', machine_id).maybeSingle();
+        const knownSlug = (ext?.account_slug && ext.account_slug !== 'unknown') ? String(ext.account_slug).toLowerCase() : null;
+        if (knownSlug) {
+          const { data: byMachine } = await sb.from('team_members').select('id, slug, full_name, display_name, account_id, role, is_active, is_bidding_enabled, permissions, aliases').eq('slug', knownSlug).eq('is_active', true).maybeSingle();
+          if (byMachine) {
+            member = byMachine;
+            if (upwork_user_id && !byMachine.upwork_user_id) await sb.from('team_members').update({ upwork_user_id }).eq('id', byMachine.id);
+          }
+        }
+      }
       if (!member) {
         await tgAlert(`⚠️ <b>Extension на unknown Upwork account</b>\nhint: <code>${account_slug_hint || '?'}</code>\nmachine: <code>${machine_id || '?'}</code>`);
         return cors({ ok: false, status: 'unknown_account', message: 'Extension running on unknown account', should_pause: true });
@@ -106,14 +124,20 @@ Deno.serve(async (req) => {
       const { account_slug, upwork_user_id, version, machine_id, user_agent, scraper_status, scraper_error, jobs_scraped_today, messages_captured_today } = body;
       if (!machine_id || !version) return cors({ error: 'need machine_id + version' }, 400);
 
+      const now = new Date().toISOString();
+      const { data: existing } = await sb.from('extension_status').select('id, version, scraper_error, last_error_alert_at, account_slug').eq('machine_id', machine_id).maybeSingle();
+
+      // v11: an 'unknown' heartbeat must NOT erase a previously-resolved account_slug —
+      // that anchor is exactly what /identify's machine_id fallback relies on.
+      const incomingSlug = (account_slug && account_slug !== 'unknown') ? account_slug : null;
+      const keepSlug = incomingSlug
+        || ((existing?.account_slug && existing.account_slug !== 'unknown') ? existing.account_slug : 'unknown');
+
       let member_id: string | null = null;
-      if (account_slug) {
-        const { data: m } = await sb.from('team_members').select('id').eq('slug', account_slug).maybeSingle();
+      if (keepSlug && keepSlug !== 'unknown') {
+        const { data: m } = await sb.from('team_members').select('id').eq('slug', keepSlug).maybeSingle();
         member_id = m?.id || null;
       }
-
-      const now = new Date().toISOString();
-      const { data: existing } = await sb.from('extension_status').select('id, version, scraper_error, last_error_alert_at').eq('machine_id', machine_id).maybeSingle();
 
       const isVersionChange = existing && existing.version !== version;
       const newError = scraper_error || null;
@@ -129,7 +153,7 @@ Deno.serve(async (req) => {
       }
 
       const updatePayload: Record<string, any> = {
-        member_id, account_slug: account_slug || 'unknown', upwork_user_id, version, user_agent,
+        member_id, account_slug: keepSlug, upwork_user_id, version, user_agent,
         last_heartbeat_at: now, last_activity_at: now,
         scraper_status: scraper_status || 'active', scraper_error: newError,
         jobs_scraped_today: jobs_scraped_today || 0, messages_captured_today: messages_captured_today || 0,
