@@ -1,4 +1,7 @@
-// OptimizeUp Extension v19.3.0 — Background Service Worker
+// OptimizeUp Extension v19.4.0 — Background Service Worker
+// v19.4.0: operator-gated AI — removed auto enrich+score. ANALYZE_JOB opens job + enrich + score_route
+//   ONLY on operator click (reviewJob returns scoreData + pushes PANEL_CARD; forceAnalyze bypasses stale guard).
+//   prematch + peak-window + skip=silence + full_text passthrough unchanged.
 // v19.3.0: STEP 2B radar — RADAR_BUILD flag; peak-window + manual-Start + tab-focus gating on
 //   reload (jittered 45–90s); reviewJob enrich→score_route→PANEL_CARD; APPROVE_COVERS → generate_cover×N.
 //   Monitoring/enrich/panel run ONLY on the radar (RADAR_BUILD); never in the Step 3 teammate build.
@@ -392,7 +395,8 @@ async function reviewJob(item) {
   // Guard: skip if job aged past threshold while sitting in buffer
   const timeInBufferMin = (Date.now() - (item.queued_at ?? Date.now())) / 60000;
   const actualAgeMin = (item.posted_ago_min ?? 0) + timeInBufferMin;
-  if (actualAgeMin > CONFIG.maxActualAgeMin) {
+  // forceAnalyze (operator pressed Analyze) bypasses the stale-age guard — they chose this job.
+  if (!item.forceAnalyze && actualAgeMin > CONFIG.maxActualAgeMin) {
     console.log(`[OU] SKIPPED ${item.upwork_id} — stale in buffer (posted ${Math.round(item.posted_ago_min ?? 0)}m + ${Math.round(timeInBufferMin)}m wait = ${Math.round(actualAgeMin)}m)`);
     logEvent('failed', { upwork_job_id: item.upwork_id, error_type: 'too_old_in_buffer', error_detail: `actualAge=${Math.round(actualAgeMin)}m`, duration_ms: 0 });
     return;
@@ -511,8 +515,9 @@ async function reviewJob(item) {
         detected_tech_stack: scoreData.detected_tech_stack || [],
         account_fit: Array.isArray(scoreData.account_fit) ? scoreData.account_fit : [],
       });
+      return scoreData;
     }
-    return;
+    return null;
   }
 
   // No usable description — close tab and log
@@ -536,6 +541,23 @@ async function sendPanelCard(card) {
     await chrome.tabs.sendMessage(tabId, { type: 'PANEL_CARD', payload: card }).catch(() => {});
     console.log(`[OU] PANEL_CARD → "${(card.title||'').substring(0,40)}" score=${card.match_score} fit=[${(card.account_fit||[]).map(f => f.account_slug + ':' + f.fit_score).join(',')}]`);
   } catch (e) { console.warn('[OU] sendPanelCard error:', e); }
+}
+
+// Operator pressed Analyze on a light card → open the job + enrich + score_route NOW (on demand).
+// reviewJob pushes PANEL_CARD (with upwork_id + score) which updates the light card in place.
+async function handleAnalyzeJob(payload) {
+  if (!payload?.url) return { ok: false, error: 'no url' };
+  if (activeJobLock) return { ok: false, error: 'busy — another analyze in progress' };
+  activeJobLock = true;
+  try {
+    const scoreData = await reviewJob({ ...payload, forceAnalyze: true, queued_at: Date.now() });
+    if (!scoreData) return { ok: false, error: 'could not read job (no description / blocked / removed)' };
+    return { ok: true, scored: true };
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e) };
+  } finally {
+    activeJobLock = false;
+  }
 }
 
 // Operator approved N accounts for a job → generate_cover per account → TG to each owner.
@@ -639,6 +661,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg?.type === 'APPROVE_COVERS') {
     handleApproveCovers(msg.payload).then(r => sendResponse(r)).catch(e => sendResponse({ error: String(e) }));
+    return true;
+  }
+  if (msg?.type === 'ANALYZE_JOB') {
+    handleAnalyzeJob(msg.payload).then(r => sendResponse(r)).catch(e => sendResponse({ error: String(e) }));
     return true;
   }
   if (msg?.type === 'GET_IDENTITY') {
