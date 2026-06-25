@@ -1,4 +1,5 @@
-// OptimizeUp Extension v19.6.1 — Background Service Worker
+// OptimizeUp Extension v19.6.2 — Background Service Worker
+// v19.6.2: + CANCEL_COVER → leadgen-v2 cancel_cover (mark proposal cancelled after a sent cover).
 // v19.6.1: AI never opens tabs. ANALYZE_FROM_PAGE scores the description content.js read off the
 //   operator's OWN open job page (no enrich tab). processNextCandidate/reviewJob disabled (dead).
 // v19.4.1: sendPanelCard broadcasts the scored card to ALL upwork tabs (search feed + the job-detail
@@ -591,6 +592,21 @@ async function handleAnalyzeFromPage(payload) {
   }
 }
 
+// Operator pressed "Отмена" → mark the job's proposal(s) cancelled in DB (TG already delivered).
+async function handleCancelCover(payload) {
+  const { job_id, account_slug } = payload || {};
+  if (!job_id) return { ok: false, error: 'need job_id' };
+  try {
+    const res = await fetch(`${SB_URL}/functions/v1/leadgen-v2`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SB_ANON_KEY}` },
+      body: JSON.stringify({ mode: 'cancel_cover', job_id, account_slug: account_slug || null }),
+    });
+    const data = await res.json().catch(() => ({}));
+    return data?.ok ? { ok: true } : { ok: false, error: data?.error || 'fail' };
+  } catch (e) { return { ok: false, error: String(e?.message || e) }; }
+}
+
 // Operator approved N accounts for a job → generate_cover per account → TG to each owner.
 async function handleApproveCovers(payload) {
   const { job_id, full_text, accounts } = payload || {};
@@ -696,6 +712,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg?.type === 'ANALYZE_FROM_PAGE') {
     handleAnalyzeFromPage(msg.payload).then(r => sendResponse(r)).catch(e => sendResponse({ error: String(e) }));
+    return true;
+  }
+  if (msg?.type === 'CANCEL_COVER') {
+    handleCancelCover(msg.payload).then(r => sendResponse(r)).catch(e => sendResponse({ error: String(e) }));
     return true;
   }
   if (msg?.type === 'GET_IDENTITY') {

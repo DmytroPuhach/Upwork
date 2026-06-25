@@ -1,5 +1,7 @@
 
-// OptimizeUp Extension v18.4.1 — Content Script
+// OptimizeUp Extension v18.4.2 — Content Script
+// v18.4.2: detail has "↩ Отмена (отозвать)" after a cover is sent → CANCEL_COVER (marks proposal
+//   cancelled, lets you redo); Cover button becomes "Cover ↻ (заново)".
 // v18.4.1: AI reads the description from the operator's OWN open job page (extractDescriptionFromPage)
 //   → ANALYZE_FROM_PAGE. No background enrich tab opened (bot-detection safety).
 // v18.4.0: detail panel now lives ON the job page. Посмотреть (feed) opens the job tab; that tab
@@ -1163,7 +1165,20 @@
 
     const st = panelEl('div', 'font-size:11px;color:#5e6d55;padding:4px 11px;min-height:14px;');
     if (card.coverStatus) st.textContent = card.coverStatus;
-    const cover = panelEl('button', `margin:6px 11px 14px;width:calc(100% - 22px);background:#14a800;color:#fff;border:0;border-radius:6px;padding:9px;font-weight:600;cursor:pointer;${fit.length ? '' : 'opacity:.4;pointer-events:none;'}`, 'Cover →');
+
+    // Отмена — shown after a cover was sent. Marks proposal(s) cancelled + lets you redo.
+    const cancel = panelEl('button', 'margin:0 11px 12px;width:calc(100% - 22px);background:#fff;border:1px solid #d9534f;color:#d9534f;border-radius:6px;padding:7px;font-weight:600;cursor:pointer;', '↩ Отмена (отозвать)');
+    cancel.style.display = card.status === 'sent' ? 'block' : 'none';
+    cancel.onclick = async () => {
+      cancel.disabled = true; cancel.style.opacity = '.5'; st.textContent = 'Отменяю…';
+      try {
+        const r = await chrome.runtime.sendMessage({ type: 'CANCEL_COVER', payload: { job_id: card.job_id } });
+        if (r?.ok) { await patchCard(key, { status: 'pending', coverStatus: 'отменено — можно переделать' }); renderDetail(key); const lc = await loadCards(); const m = lc.find(c => cardKey(c) === key); if (m) renderListRow(m, false); }
+        else { st.textContent = '❌ ' + (r?.error || 'fail'); cancel.disabled = false; cancel.style.opacity = '1'; }
+      } catch (e) { st.textContent = '❌ ' + (e?.message || e); cancel.disabled = false; cancel.style.opacity = '1'; }
+    };
+
+    const cover = panelEl('button', `margin:6px 11px 8px;width:calc(100% - 22px);background:#14a800;color:#fff;border:0;border-radius:6px;padding:9px;font-weight:600;cursor:pointer;${fit.length ? '' : 'opacity:.4;pointer-events:none;'}`, card.status === 'sent' ? 'Cover ↻ (заново)' : 'Cover →');
     cover.onclick = async () => {
       const accounts = checks.filter(c => c.checked).map(c => c.value);
       if (accounts.length === 0) { st.textContent = 'Отметь аккаунт(ы).'; return; }
@@ -1172,12 +1187,12 @@
         const resp = await chrome.runtime.sendMessage({ type: 'APPROVE_COVERS', payload: { job_id: card.job_id, full_text: card.full_text, accounts } });
         const rr = resp?.results || [];
         const line = rr.map(r => `${r.account_slug}: ${r.tg_sent ? '✅' : (r.ok ? '⚠' : '❌')}`).join(' · ');
-        st.textContent = line; cover.textContent = 'Отправлено';
+        st.textContent = line; cover.textContent = 'Отправлено'; cancel.style.display = 'block';
         await patchCard(key, { coverStatus: line, status: 'sent' });
         const lc = await loadCards(); const merged = lc.find(c => cardKey(c) === key); if (merged) renderListRow(merged, false);
       } catch (e) { st.textContent = '❌ ' + (e?.message || e); cover.disabled = false; cover.style.opacity = '1'; }
     };
-    detail.append(st, cover);
+    detail.append(st, cover, cancel);
   }
 
   const cardIdFromUrl = () => { const m = location.pathname.match(/~[\w]{12,}/); return m ? m[0] : null; };

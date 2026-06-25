@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "OptimizeUp Agency Assistant",
-  "version": "19.6.1",
-  "description": "Internal agency tool for OptimizeUp team - v19.6.1 (RADAR): AI reads the open job page in place (no auto-opened tabs) — bot-detection safe.",
+  "version": "19.6.2",
+  "description": "Internal agency tool for OptimizeUp team - v19.6.2 (RADAR): + Отмена/отозвать on sent covers; AI reads the open job page in place (no auto tabs).",
   "permissions": ["storage", "alarms", "activeTab", "scripting", "tabs"],
   "host_permissions": [
     "https://www.upwork.com/*",

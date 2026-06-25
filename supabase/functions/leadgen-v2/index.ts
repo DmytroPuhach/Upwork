@@ -1,3 +1,5 @@
+// leadgen-v2 v38 — + mode:"cancel_cover" {job_id, account_slug?} → mark proposal(s) status='cancelled'
+//   (operator "Отмена" in the radar panel after a cover was sent).
 // leadgen-v2 v37 — SPLIT score/route from cover generation (human-in-the-loop).
 //   Single Deno.serve, routed by body.mode:
 //     mode:"score_route"   → ONE Claude call (bid_decision_prompt_v3 + knowledge_base_v3, NO cover).
@@ -736,7 +738,19 @@ Deno.serve(async (req) => {
       return json(r, r.ok ? 200 : 500);
     }
 
-    return json({ error: 'unknown mode', expected: ['score_route', 'generate_cover'], note: 'funnel ingest via ingest_only:true' }, 400);
+    // Operator pressed "Отмена" in the panel after a cover was generated → mark proposal(s) cancelled.
+    // (TG message already delivered; this flags the DB so the owner/dashboard knows not to submit.)
+    if (mode === 'cancel_cover') {
+      if (!body.job_id) return json({ error: 'need job_id' }, 400);
+      let q = sb.from('proposals').update({ status: 'cancelled', updated_at: new Date().toISOString() }).eq('job_id', body.job_id);
+      if (body.account_slug) q = q.eq('member_slug', body.account_slug);
+      const { error } = await q;
+      if (error) return json({ error: error.message }, 500);
+      await dbg(sb, 'cover_cancelled', { job_id: body.job_id, account_slug: body.account_slug || 'all' });
+      return json({ ok: true });
+    }
+
+    return json({ error: 'unknown mode', expected: ['score_route', 'generate_cover', 'cancel_cover'], note: 'funnel ingest via ingest_only:true' }, 400);
   } catch (err) {
     return json({ error: String(err?.message || err) }, 500);
   }
