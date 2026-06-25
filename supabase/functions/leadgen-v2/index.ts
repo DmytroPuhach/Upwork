@@ -1,3 +1,5 @@
+// leadgen-v2 v39 — account_fit now returns EVERY enabled account (weak fits get a low score + risk,
+//   never omitted) so the operator always sees dima/david/vika and decides. Was: only-fits.
 // leadgen-v2 v38 — + mode:"cancel_cover" {job_id, account_slug?} → mark proposal(s) status='cancelled'
 //   (operator "Отмена" in the radar panel after a cover was sent).
 // leadgen-v2 v37 — SPLIT score/route from cover generation (human-in-the-loop).
@@ -56,7 +58,7 @@ Schema:
 }
 Rules:
 - Use account_slug values EXACTLY as given in Active Accounts. Never invent slugs.
-- account_fit: ONLY accounts that should bid, sorted by fit_score DESC. decision=skip → account_fit=[].
+- account_fit: include EVERY account listed in Active Accounts — NEVER omit one. A weak fit still appears with a LOW fit_score (e.g. 20-45) and a risks note explaining the mismatch; a strong fit gets a high score. Sort by fit_score DESC. The operator decides who actually bids. EXCEPTION: decision=skip → account_fit=[].
 - match_score = overall job quality (0-100); fit_score = per-account suitability.
 - Start with { and end with } — raw JSON only.`;
 
