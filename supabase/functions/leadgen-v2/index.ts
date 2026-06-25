@@ -1,3 +1,6 @@
+// leadgen-v2 v41 — FIX: sibling-cover block split a surrogate pair (Unicode bold) → Anthropic 400
+//   "no low surrogate" → dima/vika covers failed. Now code-point-safe truncate (safeSlice) + lone-
+//   surrogate scrub (scrubSurr), applied to sibling block AND all TG text cuts.
 // leadgen-v2 v40 — anti multi-accounting: generate_cover now loads sibling covers already written
 //   for the SAME job by other team accounts and feeds them to Claude with "diverge hard" so the 3
 //   covers (Dima/David/Vika) don't look templated. Pairs with cover_generator_prompt_v3 (DB) edit:
@@ -43,6 +46,10 @@ const BID_DECISIONS = ['bid_high', 'bid_medium', 'bid_low'];
 
 const db = () => createClient(SB_URL, SB_KEY, { db: { schema: 'upwork' } });
 const esc = (t) => String(t || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+// Code-point-safe truncate (never splits a surrogate pair → no "no low surrogate" JSON 400).
+const safeSlice = (t, max) => Array.from(String(t || '')).slice(0, max).join('');
+// Drop any lone surrogates (defensive — astral chars like Unicode bold survive, orphans don't).
+const scrubSurr = (s) => String(s || '').replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '');
 const json = (obj: any, status = 200) =>
   new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json' } });
 
@@ -407,7 +414,7 @@ async function generateCoverClaude(fullText, account, job, sb, siblingCovers: an
   const siblingBlock = (Array.isArray(siblingCovers) && siblingCovers.length)
     ? `\n\n## Каверы соседних аккаунтов на ЭТУ ЖЕ вакансию (уже написаны нашими другими аккаунтами)
 Твой кавер ОБЯЗАН быть ЯВНО другим: другой первый заход (первая строка), другой кейс из базы, другая структура и другие формулировки. НИКАКИХ совпадающих предложений или фраз. Одинаковые письма с родственных аккаунтов = палево мульти-аккаунтинга — это недопустимо.
-${siblingCovers.map(s => `--- ${s.member_slug} ---\n${String(s.proposal_text || '').substring(0, 900)}`).join('\n\n')}`
+${siblingCovers.map(s => `--- ${s.member_slug} ---\n${scrubSurr(safeSlice(s.proposal_text, 600))}`).join('\n\n')}`
     : '';
 
   const userMsg = `## Job (full text)
@@ -433,9 +440,9 @@ async function sendCoverTg(account, job, cover, extraQa, proposalId) {
   let msg = `🔥 <b>Upwork Lead</b> — <b>${esc(accName)}</b>\n\n`;
   msg += `<b>${esc(job.title || '')}</b>\n`;
   if (jobUrl) msg += `${esc(jobUrl)}\n`;
-  msg += `\n<b>Cover:</b>\n<pre>${esc((cover || '').substring(0, 2800))}</pre>`;
+  msg += `\n<b>Cover:</b>\n<pre>${esc(scrubSurr(safeSlice(cover, 2800)))}</pre>`;
   if (extraQa && String(extraQa).trim()) {
-    msg += `\n\n❓ <b>Screening:</b>\n${esc(String(extraQa).substring(0, 800))}`;
+    msg += `\n\n❓ <b>Screening:</b>\n${esc(scrubSurr(safeSlice(extraQa, 800)))}`;
   }
 
   const buttons: any[] = [];
@@ -454,7 +461,7 @@ async function sendCoverTg(account, job, cover, extraQa, proposalId) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         chat_id: chatId,
-        text: msg.substring(0, 4000),
+        text: scrubSurr(safeSlice(msg, 4000)),
         parse_mode: 'HTML',
         disable_web_page_preview: true,
         reply_markup: buttons.length > 0 ? { inline_keyboard: buttons } : undefined,

@@ -1,5 +1,8 @@
 
-// OptimizeUp Extension v18.5.0 — Content Script
+// OptimizeUp Extension v18.5.1 — Content Script
+// v18.5.1: feed order = quality + freshness decay (freshnessAdj) — fresh floats up, stale sinks even
+//   if high-quality; skipped sink to bottom. posted_at_ms frozen per card; 75s re-sort timer. Age
+//   removed from prematchScore (shown score = stable quality).
 // v18.5.0: prematch reworked (operator-gated). Hard-skip ONLY "never us" (country/employment/agency/
 //   content/native/training); off_niche/budget/rating/too_competitive/too_old DEMOTED to score
 //   penalties (sink, stay visible). Feed sorted by score best-on-top (sortListRows).
@@ -559,15 +562,21 @@
       }
     }
 
-    const age = j.posted_ago_min;                                           // too_old → graduated sink
-    if (age != null) {
-      if (age <= 30) s += 6;
-      else if (age <= 120) s += 0;
-      else if (age <= 1440) s -= 15;
-      else s -= 25;
-    }
-
+    // NOTE: freshness is NOT scored here anymore — it's applied in sortListRows (recency decay) so a
+    // job's quality score stays stable while it sinks as it ages. Keeps pre-score = pure quality.
     return Math.max(0, Math.min(100, s));
+  }
+
+  // Recency decay used ONLY for feed ordering (not the shown score): fresh floats up, stale sinks.
+  function freshnessAdj(ageMin) {
+    if (ageMin == null) return -8;          // unknown age → mild sink
+    if (ageMin <= 15) return 35;
+    if (ageMin <= 30) return 25;
+    if (ageMin <= 60) return 12;
+    if (ageMin <= 120) return 0;
+    if (ageMin <= 240) return -15;
+    if (ageMin <= 480) return -30;
+    return -45;
   }
 
   const JOB_STRATEGIES = [
@@ -985,6 +994,8 @@
     panel.append(header, stats, list, detail);
     document.body.appendChild(panel);
     makeDraggable(panel, header);
+    // Re-sort every 75s so jobs age and sink even when no new card arrives.
+    if (!window.__ouAgingTimer) window.__ouAgingTimer = setInterval(() => { try { sortListRows(); } catch {} }, 75000);
     return panel;
   }
 
@@ -1052,6 +1063,8 @@
     const list = document.getElementById(PANEL_ID + '-list');
     if (!list) return;
     const key = cardKey(card);
+    // freeze an absolute "posted at" so the row can age in the feed (stable across reloads).
+    if (card.posted_at_ms == null) card.posted_at_ms = Date.now() - (Number(card.posted_ago_min) || 0) * 60000;
     if (persist) upsertCard(card);
 
     let wrap = list.querySelector(`[data-ou-card="${key}"]`);
@@ -1060,8 +1073,11 @@
     else wrap.textContent = '';
 
     const analyzed = card.match_score != null;
-    // sort key: skipped sinks; otherwise AI score if analyzed, else pre-score.
-    wrap.setAttribute('data-ou-score', String(card.status === 'skipped' ? -10 : (analyzed ? card.match_score : (card.prematch_score != null ? card.prematch_score : -1))));
+    // sort inputs: quality (AI score if analyzed, else pre-score) + posted time + status. Freshness
+    // decay + skipped-sink are applied in sortListRows, so quality stays a stable number.
+    wrap.setAttribute('data-ou-quality', String(analyzed ? card.match_score : (card.prematch_score != null ? card.prematch_score : -1)));
+    wrap.setAttribute('data-ou-posted', String(card.posted_at_ms || 0));
+    wrap.setAttribute('data-ou-status', card.status || 'pending');
     const scColor = analyzed ? (card.match_score >= 70 ? '#14a800' : card.match_score >= 50 ? '#b35900' : '#9aa0a6') : (card.prematch_score != null ? '#3c8dbc' : '#9aa0a6');
     const scoreText = analyzed ? String(card.match_score) : (card.prematch_score != null ? '~' + card.prematch_score : '—');
 
@@ -1074,7 +1090,7 @@
     x.title = 'Отклонить';
     const open = (e) => { if (e) e.stopPropagation(); openAndAnalyze(key); };
     view.onclick = open; t.onclick = open;
-    x.onclick = (e) => { e.stopPropagation(); patchCard(key, { status: 'skipped' }); styleRow(wrap, t, 'skipped'); wrap.setAttribute('data-ou-score', '-10'); sortListRows(); };
+    x.onclick = (e) => { e.stopPropagation(); patchCard(key, { status: 'skipped' }); styleRow(wrap, t, 'skipped'); wrap.setAttribute('data-ou-status', 'skipped'); sortListRows(); };
     row.append(sb, t, view, x);
     wrap.append(row);
     styleRow(wrap, t, card.status || 'pending');
@@ -1083,13 +1099,20 @@
     updatePanelCount();
   }
 
-  // Keep the feed sorted best-on-top (by AI score if analyzed, else pre-score; skipped sink).
+  // Feed order = quality + freshness decay; skipped sink to the bottom. Fresh jobs float up; a job
+  // sinks as it ages even if its quality is high (catch fresh ones first).
   function sortListRows() {
     const list = document.getElementById(PANEL_ID + '-list');
     if (!list) return;
-    const rows = [...list.querySelectorAll('[data-ou-card]')];
-    rows.sort((a, b) => (Number(b.getAttribute('data-ou-score')) || -1) - (Number(a.getAttribute('data-ou-score')) || -1));
-    rows.forEach(r => list.appendChild(r));
+    const now = Date.now();
+    const eff = (el) => {
+      if (el.getAttribute('data-ou-status') === 'skipped') return -1000;
+      const q = Number(el.getAttribute('data-ou-quality')); if (isNaN(q)) return -999;
+      const posted = Number(el.getAttribute('data-ou-posted')) || 0;
+      const ageMin = posted ? (now - posted) / 60000 : null;
+      return q + freshnessAdj(ageMin);
+    };
+    [...list.querySelectorAll('[data-ou-card]')].sort((a, b) => eff(b) - eff(a)).forEach(r => list.appendChild(r));
   }
 
   function showList() {
