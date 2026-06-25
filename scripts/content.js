@@ -1,5 +1,8 @@
 
-// OptimizeUp Extension v18.4.2 — Content Script
+// OptimizeUp Extension v18.5.0 — Content Script
+// v18.5.0: prematch reworked (operator-gated). Hard-skip ONLY "never us" (country/employment/agency/
+//   content/native/training); off_niche/budget/rating/too_competitive/too_old DEMOTED to score
+//   penalties (sink, stay visible). Feed sorted by score best-on-top (sortListRows).
 // v18.4.2: detail has "↩ Отмена (отозвать)" after a cover is sent → CANCEL_COVER (marks proposal
 //   cancelled, lets you redo); Cover button becomes "Cover ↻ (заново)".
 // v18.4.1: AI reads the description from the operator's OWN open job page (extractDescriptionFromPage)
@@ -473,10 +476,6 @@
     const desc = (job.description || '').toLowerCase();
     const country = resolveCountry(job.client_country || '').toLowerCase().trim();
 
-    const matched = Number(job.matched_skills) || 0;
-    const total = Number(job.total_skills) || 0;
-    const broadSeo = /\bseo\b|\baudit\b|\brank(?:ing)?\b|\bserp\b|\bsearch engine\b|\blink\s+building\b|\bbacklink\b|\boutreach\b|\bcontent optimization\b|\bon[-\s]page\b|\boff[-\s]page\b|\bindex(?:ation|ing)?\b|\bkeyword research\b|\borganic search\b|\borganic traffic\b|\bgoogle (?:search|analytics|search console)\b|\btraffic growth\b/.test(title + ' ' + desc);
-
     // 1. Country blocked — hard no-go
     if (country && Array.isArray(blockedCountries) && blockedCountries.length > 0) {
       const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z]/g, '');
@@ -514,55 +513,10 @@
       return { action: 'skip', reason: 'training_role' };
     }
 
-    // 3. Off_niche — режем ТОЛЬКО если skills извлечены AND matched=0 AND title без broadSeo
-    // Если chips не извлеклись (total=0) — НЕ режем, пусть Match Agent решает с full desc.
-    if (total > 0 && matched === 0 && !broadSeo) {
-      return { action: 'skip', reason: 'off_niche' };
-    }
-
-    // 4. Budget_too_low — режем только если НЕТ matching signals AND budget мусорный
-    // v17.1.7: свежак с matched_skills>=2 может быть "пробный туз" клиента с низким
-    // budget — ты первый, offer roadmap для большого проекта, входишь в контракт.
-    // Не режем если есть ЛЮБОЙ positive signal.
-    if (job.budget_type === 'fixed' && typeof job.budget_max === 'number' &&
-        job.budget_max > 0 && job.budget_max < 30) {
-      const hasHistory = typeof job.client_spent_rough === 'number' && job.client_spent_rough > 500;
-      const hasMatching = matched >= 1;  // Upwork сам отметил skill overlap
-      const hasBroadSeo = broadSeo;      // title/desc упоминает SEO
-      if (!hasHistory && !hasMatching && !hasBroadSeo) {
-        return { action: 'skip', reason: 'budget_too_low' };
-      }
-    }
-
-    // 4b. Hourly rate too low — Expert SEO/GEO work under $25/hr is not viable
-    if (job.budget_type === 'hourly' && typeof job.budget_max === 'number' &&
-        job.budget_max > 0 && job.budget_max < 25) {
-      const hasHistory = typeof job.client_spent_rough === 'number' && job.client_spent_rough > 500;
-      const hasMatching = matched >= 1;
-      if (!hasHistory && !hasMatching) {
-        return { action: 'skip', reason: 'budget_too_low' };
-      }
-    }
-
-    // 5. Rating_too_low — режем только явно низкий (<3.0). Null rating пропускаем.
-    if (typeof job.client_rating === 'number' && job.client_rating > 0 && job.client_rating < 3.0) {
-      return { action: 'skip', reason: 'rating_too_low' };
-    }
-
-    // 6. Too_competitive — v18.0.1: proposals_min >= 20 = skip, не тратим токены.
-    // "20 to 50" на карточке = минимум 20 конкурентов уже там. Claude дорого, смысла нет.
-    // proposals_min=null (не извлеклось) — не режем, пусть Match Agent решает.
-    if (typeof job.proposals_min === 'number' && job.proposals_min >= 20) {
-      return { action: 'skip', reason: 'too_competitive' };
-    }
-
-    // 7. Too_old — v17.2.0 FRESH FIRST: >30 min = skip, никаких исключений.
-    // Старые вакансии = 50+ proposals = Top Rated уже там. Смысла нет.
-    // Если >30 min висит — либо никто нормальный не идёт (мусор), либо толпа (мы не конкурент).
-    if (typeof job.posted_ago_min === 'number' && job.posted_ago_min > 30) {
-      return { action: 'skip', reason: 'too_old' };
-    }
-
+    // v19.7: operator-gated — AI burns money ONLY on click, so we no longer HARD-skip "borderline"
+    // jobs (off_niche / budget_too_low / rating_too_low / too_competitive / too_old). They stay in
+    // the feed but sink to the bottom via prematchScore penalties. Only "never us" is hard-skipped
+    // above (country, employment, agency, pure_content, call_heavy, native, training).
     return { action: 'enqueue' };
   }
 
@@ -572,23 +526,47 @@
   function prematchScore(j) {
     let s = 40;
     const matched = Number(j.matched_skills) || 0, total = Number(j.total_skills) || 0;
-    if (total > 0) s += Math.round((matched / total) * 25);                 // skill overlap → +25
     const txt = ((j.title || '') + ' ' + (j.skills || []).join(' ')).toLowerCase();
-    if (/\bseo\b|audit|technical seo|on[-\s]page|local seo|gmb|google business|schema|\bgeo\b|ai search|aeo|core web vitals|search console/.test(txt)) s += 12;
-    if (/\b(writer|copywriter|content writer|article)\b/.test(txt)) s -= 12; // pure content = off-core
+    const seoHit = /\bseo\b|audit|technical seo|on[-\s]page|local seo|gmb|google business|schema|\bgeo\b|ai search|aeo|core web vitals|search console|backlink|link building|\bserp\b|keyword|organic/.test(txt);
     const spent = Number(j.client_spent_rough) || 0;
+
+    if (total > 0) s += Math.round((matched / total) * 25);                 // skill overlap → +25
+    if (seoHit) s += 12;
+    if (/\b(writer|copywriter|content writer|article)\b/.test(txt)) s -= 12; // pure content = off-core
+
+    // off_niche (demoted from hard-skip): skills extracted, none matched, no SEO signal → sink
+    if (total > 0 && matched === 0 && !seoHit) s -= 25;
+
     if (spent >= 10000) s += 14; else if (spent >= 1000) s += 7; else if (spent === 0) s -= 6;
+
     const rating = Number(j.client_rating);
-    if (rating >= 4.8) s += 6; else if (rating > 0 && rating < 3) s -= 10;
+    if (rating >= 4.8) s += 6; else if (rating > 0 && rating < 3) s -= 25;  // rating_too_low → sink
+
     if (j.payment_verified === true) s += 5; else if (j.payment_verified === false) s -= 5;
-    const pm = j.proposals_min;
-    if (pm != null) { if (pm < 5) s += 10; else if (pm < 10) s += 4; else if (pm >= 20) s -= 12; }
+
+    const pm = j.proposals_min;                                             // too_competitive → sink
+    if (pm != null) { if (pm < 5) s += 10; else if (pm < 10) s += 4; else if (pm >= 50) s -= 30; else if (pm >= 20) s -= 20; }
+
     const bm = Number(j.budget_max);
     if (!isNaN(bm) && bm > 0) {
       if ((j.budget_type === 'hourly' && bm >= 25) || (j.budget_type === 'fixed' && bm >= 100)) s += 6;
-      else if (bm < 15) s -= 8;
+      else {
+        const lowFixed = j.budget_type === 'fixed' && bm < 30;
+        const lowHourly = j.budget_type === 'hourly' && bm < 25;
+        // budget_too_low (demoted): trash budget AND no redeeming signal → sink. Else mild.
+        if ((lowFixed || lowHourly) && !(spent > 500) && matched < 1 && !seoHit) s -= 18;
+        else if (bm < 15) s -= 8;
+      }
     }
-    if (j.posted_ago_min != null && j.posted_ago_min <= 30) s += 6;
+
+    const age = j.posted_ago_min;                                           // too_old → graduated sink
+    if (age != null) {
+      if (age <= 30) s += 6;
+      else if (age <= 120) s += 0;
+      else if (age <= 1440) s -= 15;
+      else s -= 25;
+    }
+
     return Math.max(0, Math.min(100, s));
   }
 
@@ -1082,6 +1060,8 @@
     else wrap.textContent = '';
 
     const analyzed = card.match_score != null;
+    // sort key: skipped sinks; otherwise AI score if analyzed, else pre-score.
+    wrap.setAttribute('data-ou-score', String(card.status === 'skipped' ? -10 : (analyzed ? card.match_score : (card.prematch_score != null ? card.prematch_score : -1))));
     const scColor = analyzed ? (card.match_score >= 70 ? '#14a800' : card.match_score >= 50 ? '#b35900' : '#9aa0a6') : (card.prematch_score != null ? '#3c8dbc' : '#9aa0a6');
     const scoreText = analyzed ? String(card.match_score) : (card.prematch_score != null ? '~' + card.prematch_score : '—');
 
@@ -1094,12 +1074,22 @@
     x.title = 'Отклонить';
     const open = (e) => { if (e) e.stopPropagation(); openAndAnalyze(key); };
     view.onclick = open; t.onclick = open;
-    x.onclick = (e) => { e.stopPropagation(); patchCard(key, { status: 'skipped' }); styleRow(wrap, t, 'skipped'); };
+    x.onclick = (e) => { e.stopPropagation(); patchCard(key, { status: 'skipped' }); styleRow(wrap, t, 'skipped'); wrap.setAttribute('data-ou-score', '-10'); sortListRows(); };
     row.append(sb, t, view, x);
     wrap.append(row);
     styleRow(wrap, t, card.status || 'pending');
-    if (fresh) list.prepend(wrap);
+    if (fresh) list.appendChild(wrap);
+    sortListRows();
     updatePanelCount();
+  }
+
+  // Keep the feed sorted best-on-top (by AI score if analyzed, else pre-score; skipped sink).
+  function sortListRows() {
+    const list = document.getElementById(PANEL_ID + '-list');
+    if (!list) return;
+    const rows = [...list.querySelectorAll('[data-ou-card]')];
+    rows.sort((a, b) => (Number(b.getAttribute('data-ou-score')) || -1) - (Number(a.getAttribute('data-ou-score')) || -1));
+    rows.forEach(r => list.appendChild(r));
   }
 
   function showList() {
