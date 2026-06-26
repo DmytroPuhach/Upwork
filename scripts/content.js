@@ -1,5 +1,9 @@
 
-// OptimizeUp Extension v18.5.6 — Content Script
+// OptimizeUp Extension v18.5.7 — Content Script
+// v18.5.7: fix "card on page missing from feed". Root cause: dedup `ou_seen_jobs` outlived the panel
+//   (Clear/reload) → seen.has → skipped render forever. Now `seen` gates FUNNEL ingest only; the panel
+//   re-renders ANY passing on-page card not already in it (toRender by panel membership, not by seen).
+//   Existing cards (AI score / skipped) untouched.
 // v18.5.6: radar panel tied to scrapingActive. Start → panel shows; Stop → panel closes (any page,
 //   incl. profile via SPA). handleJobCards no-ops when scraping is OFF (no scraping without Start).
 //   Fixes "panel hangs/catches even though Start wasn't pressed".
@@ -775,8 +779,10 @@
       }
 
       const seen = getSeenSet('jobs');
-      const newJobs = [];
-      const skippedByPrematch = [];  // v17.1.5: для логирования в dashboard
+      const panelKeys = new Set((await loadCards()).map((c) => cardKey(c)));
+      const newJobs = [];            // new-to-seen & passing → funnel ingest + scan stats
+      const skippedByPrematch = [];  // new-to-seen & skipped → dashboard ingest_only
+      const toRender = [];           // passing & NOT yet in panel → ensure it shows (re-adds "lost" cards)
 
       // v17.1.5: достаём spec + blocked_countries один раз, переиспользуем в цикле
       const { cachedIdentity: identity } = await chrome.storage.local.get('cachedIdentity');
@@ -790,9 +796,10 @@
 
           const upworkId = extractJobId(data.url);
           const fingerprint = upworkId || hash((data.title || '').substring(0, 100) + '|' + (data.url || '').substring(0, 200));
-          if (seen.has(fingerprint)) continue;
-
-          addSeen('jobs', fingerprint);
+          // seen gates FUNNEL ingest only (once). Rendering is gated by panel membership below — so a
+          // card already in `seen` but missing from the panel (cleared/reloaded) still gets re-added.
+          const isNew = !seen.has(fingerprint);
+          if (isNew) addSeen('jobs', fingerprint);
 
           const budget = parseBudget(data.budget || data.raw_text || '');
 
@@ -823,10 +830,12 @@
           // v17.1.5: client-side prematch. Skip = не тратим enrichment слот.
           const verdict = prematchDecide(jobPayload, accountSpec, blockedCountries);
           if (verdict.action === 'skip') {
-            skippedByPrematch.push({ job: jobPayload, reason: verdict.reason });
-          } else {
-            newJobs.push(jobPayload);
+            if (isNew) skippedByPrematch.push({ job: jobPayload, reason: verdict.reason });
+            continue;
           }
+          if (isNew) newJobs.push(jobPayload);
+          const key = cardKey(jobPayload);
+          if (!panelKeys.has(key)) { toRender.push(jobPayload); panelKeys.add(key); }
         } catch (e) { warn('Job extract error:', e); }
       }
 
@@ -853,27 +862,28 @@
         for (const j of newJobs.slice(0, 10)) {
           chrome.runtime.sendMessage({ type: 'JOB_SCRAPED', payload: j }).catch(() => {});   // funnel ingest only
         }
-        // operator-gated: render LIGHT cards from search data (no tab, no Claude).
-        // AI scoring happens later, per card, when the operator clicks Analyze.
-        for (const j of newJobs.slice(0, 15)) {
-          renderListRow({
-            upwork_id: j.upwork_id,
-            url: j.url,
-            title: j.title,
-            budget: j.budget_raw || ((j.budget_type ? j.budget_type + ' ' : '') + (j.budget_max ? '$' + j.budget_max : '')).trim(),
-            client_country: j.client_country,
-            client_rating: j.client_rating,
-            client_spent_rough: j.client_spent_rough,
-            payment_verified: j.payment_verified,
-            proposals_min: j.proposals_min,
-            skills: j.skills,
-            matched_skills: j.matched_skills,
-            total_skills: j.total_skills,
-            posted_ago_min: j.posted_ago_min,
-            prematch_score: prematchScore(j),
-            status: 'pending',
-          });
-        }
+      }
+      // operator-gated: render LIGHT cards (no tab, no Claude). Renders ANY passing on-page card not
+      // already in the panel — re-adds cards lost from the feed while still in `seen`. Cards already in
+      // the panel (with AI score / skipped status) are in panelKeys → untouched.
+      for (const j of toRender.slice(0, 25)) {
+        renderListRow({
+          upwork_id: j.upwork_id,
+          url: j.url,
+          title: j.title,
+          budget: j.budget_raw || ((j.budget_type ? j.budget_type + ' ' : '') + (j.budget_max ? '$' + j.budget_max : '')).trim(),
+          client_country: j.client_country,
+          client_rating: j.client_rating,
+          client_spent_rough: j.client_spent_rough,
+          payment_verified: j.payment_verified,
+          proposals_min: j.proposals_min,
+          skills: j.skills,
+          matched_skills: j.matched_skills,
+          total_skills: j.total_skills,
+          posted_ago_min: j.posted_ago_min,
+          prematch_score: prematchScore(j),
+          status: 'pending',
+        });
       }
     } finally {
       jobsInFlight = false;
