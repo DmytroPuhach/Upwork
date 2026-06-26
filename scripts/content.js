@@ -1,5 +1,8 @@
 
-// OptimizeUp Extension v18.5.9 — Content Script
+// OptimizeUp Extension v18.5.10 — Content Script
+// v18.5.10: + Скип button in the detail (reject without going back to ✕). Prematch triggers extended:
+//   employment now catches account manager / client success / account executive / project manager /
+//   team lead; language gate catches "fluent english required". (Fixes GMB Account Manager slipping in.)
 // v18.5.9: fix panel "blinks / won't open" — radar auto-reload was wiping the page mid-interaction.
 //   Now any panel click defers reload 90s, opening a card detail defers 3 min (operatorBusyUntil →
 //   background skips reload). No reload under the operator's hands.
@@ -519,7 +522,7 @@
     }
 
     // 2. Title stopwords — hard no-go (employment / agency / pure_content / call_heavy)
-    if (/\bjunior\s+seo|\bentry[-\s]level|full[-\s]time\s+seo|seo\s+assistant|seo\s+administrator/.test(title)) {
+    if (/\bjunior\s+seo|\bentry[-\s]level|full[-\s]time\s+seo|seo\s+assistant|seo\s+administrator|account\s+manager|client\s+success|account\s+executive|project\s+manager|\bteam\s+lead\b/.test(title)) {
       return { action: 'skip', reason: 'title_employment' };
     }
     if (/white[-\s]label|freelancers?\s+to\s+join|contractor\s+pool|for\s+our\s+agency|join\s+our\s+agency/.test(title + ' ' + desc)) {
@@ -531,8 +534,8 @@
     if (/30[-\s]minute consultation|paid consultation|coaching session|strategy call only/.test(title + ' ' + desc)) {
       return { action: 'skip', reason: 'title_call_heavy' };
     }
-    // Native language required — we don't qualify
-    if (/\bnative\s+(?:english|spanish|french|german|arabic|italian|portuguese|dutch|polish|language)\b|\bnative[-\s]level\s+\w+/.test(title + ' ' + desc)) {
+    // Native / fluent-language gate — we don't qualify (staffing-style requirement)
+    if (/\bnative\s+(?:english|spanish|french|german|arabic|italian|portuguese|dutch|polish|language)\b|\bnative[-\s]level\s+\w+|\bfluent\s+english\s+required\b|\bmust\s+be\s+fluent\s+in\s+english\b/.test(title + ' ' + desc)) {
       return { action: 'skip', reason: 'native_required' };
     }
     // Training/coaching role — implies calls, waste of time
@@ -1209,6 +1212,17 @@
     const openLink = panelEl('button', 'background:none;border:0;color:#3c8dbc;cursor:pointer;font-size:12px;padding:0 11px 6px;text-align:left;', '↗ открыть вакансию');
     openLink.onclick = () => openJobTab(card.url);
     detail.append(openLink);
+
+    // Skip straight from the detail (no need to go back to the list ✕). Marks skipped + returns to list.
+    if (card.status !== 'skipped') {
+      const skipBtn = panelEl('button', 'margin:0 11px 8px;background:#fff;border:1px solid #d9534f;color:#d9534f;border-radius:6px;padding:5px 11px;font-size:12px;font-weight:600;cursor:pointer;', '✕ Скип — не подходит');
+      skipBtn.onclick = async () => {
+        await patchCard(key, { status: 'skipped' });
+        const lc = await loadCards(); const m = lc.find(c => cardKey(c) === key); if (m) renderListRow(m, false);
+        showList();
+      };
+      detail.append(skipBtn);
+    }
 
     if (card.match_score == null) {
       if (card.analyzeError) {
