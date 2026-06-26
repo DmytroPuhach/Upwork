@@ -1,3 +1,5 @@
+// leadgen-v2 v44 — cover_voice log now distinguishes own_winners (PROVEN) / descriptive_only /
+//   dima_style_fallback / none, with has_winners flag — so you always see who runs on proven material.
 // leadgen-v2 v43 — per-account VOICE corpus. generate_cover loads {slug}_winner_proposals/
 //   _winning_cover_letters/_communication_style/_sales_patterns/_proven_techniques from opus_knowledge.
 //   Own winners → real voice; zero account (no winners) → Dima winners as STYLE TEMPLATE only (no
@@ -417,8 +419,10 @@ async function buildVoiceBlock(sb, slug) {
     const hasWinners = present.some((x) => x.winner);
     const parts = present.map((x) => `### ${x.label}\n${scrubSurr(safeSlice(map[`${slug}_${x.t}`], x.cap))}`);
     return {
-      mode: hasWinners ? 'own' : 'own_no_winners',
+      // own_winners = running on PROVEN material; descriptive_only = has voice description but NO winners.
+      mode: hasWinners ? 'own_winners' : 'descriptive_only',
       loaded: present.map((x) => x.t),
+      has_winners: hasWinners,
       block: `\n\n---\n\n## ГОЛОС АККАУНТА «${slug}» — РЕАЛЬНЫЕ МАТЕРИАЛЫ ЭТОГО АККАУНТА\nПиши кавер В ЭТОМ голосе/стиле — это собственные материалы аккаунта.\n${parts.join('\n\n')}`,
     };
   }
@@ -432,11 +436,12 @@ async function buildVoiceBlock(sb, slug) {
   if (src) {
     return {
       mode: 'dima_style_fallback',
+      has_winners: false,
       loaded: [dmap['dima_winning_cover_letters'] ? 'dima_winning_cover_letters' : 'dima_winner_proposals'],
       block: `\n\n---\n\n## STYLE TEMPLATE (структура и тон) — это каверы DIMA, НЕ этого аккаунта\nУ «${slug}» нет своих выигравших материалов. Отрази СТРУКТУРУ и ТОН примеров ниже, но НЕ используй статистику, бейдж Top Rated Plus или личные цифры Dima — у этого аккаунта НЕТ трек-рекорда, который можно цитировать. Метрики/кейсы — только агентские из knowledge_base, без личной статистики аккаунта.\n${scrubSurr(safeSlice(src, 3000))}`,
     };
   }
-  return { mode: 'none', loaded: [], block: '' };
+  return { mode: 'none', has_winners: false, loaded: [], block: '' };
 }
 
 // ENDPOINT B helper: generate ONE cover on full job text. system = cover_generator_prompt_v3 + knowledge_base_v3.
@@ -453,7 +458,7 @@ async function generateCoverClaude(fullText, account, job, sb, siblingCovers: an
 
   // Per-account voice: own corpus, or Dima STYLE fallback, or nothing (logged, never empty-injected).
   const voice = await buildVoiceBlock(sb, account.slug);
-  await dbg(sb, 'cover_voice', { account: account.slug, mode: voice.mode, loaded: voice.loaded });
+  await dbg(sb, 'cover_voice', { account: account.slug, mode: voice.mode, has_winners: voice.has_winners, loaded: voice.loaded });
   const system = baseSystem + voice.block;
 
   const profile = {
