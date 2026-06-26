@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "OptimizeUp Agency Assistant",
-  "version": "19.7.8",
-  "description": "Internal agency tool for OptimizeUp team - v19.7.8 (RADAR): cover answers screening questions (read off job page, human-style); on-page cards no longer missing from feed; panel tied to Start/Stop.",
+  "version": "19.7.9",
+  "description": "Internal agency tool for OptimizeUp team - v19.7.9 (RADAR): no auto-reload while operator works the panel (fixes blink/won't-open); cover answers screening questions; on-page cards no longer missing.",
   "permissions": ["storage", "alarms", "activeTab", "scripting", "tabs"],
   "host_permissions": [
     "https://www.upwork.com/*",

@@ -1,5 +1,8 @@
 
-// OptimizeUp Extension v18.5.8 — Content Script
+// OptimizeUp Extension v18.5.9 — Content Script
+// v18.5.9: fix panel "blinks / won't open" — radar auto-reload was wiping the page mid-interaction.
+//   Now any panel click defers reload 90s, opening a card detail defers 3 min (operatorBusyUntil →
+//   background skips reload). No reload under the operator's hands.
 // v18.5.8: extractScreeningFromPage() — reads screening/additional questions off the open job page
 //   into enrichment.screening_questions (+ strategy telemetry). Cover now answers them human-style
 //   (cover prompt §5b). Backend already persisted/forwarded them; content was sending [].
@@ -995,6 +998,9 @@
     });
   }
 
+  // Tell the radar "operator is interacting" → background defers auto-reload (no blink mid-click).
+  function bumpBusy(ms) { try { chrome.storage.local.set({ operatorBusyUntil: Date.now() + ms }); } catch {} }
+
   function ensurePanel() {
     let panel = document.getElementById(PANEL_ID);
     if (panel) return panel;
@@ -1045,6 +1051,7 @@
     panel.append(header, stats, list, detail);
     document.body.appendChild(panel);
     makeDraggable(panel, header);
+    panel.addEventListener('click', () => bumpBusy(90000), true);   // any panel click defers reload 90s
     // Re-render every 75s so ranks age (freshness decays) and the feed re-sorts even with no new card.
     if (!window.__ouAgingTimer) window.__ouAgingTimer = setInterval(() => { try { refreshFeed(); } catch {} }, 75000);
     return panel;
@@ -1179,6 +1186,7 @@
 
   function showDetail(key) {
     currentDetailKey = key;
+    bumpBusy(180000);   // viewing a card → hold off auto-reload for 3 min
     const list = document.getElementById(PANEL_ID + '-list'); const detail = document.getElementById(PANEL_ID + '-detail');
     if (list) list.style.display = 'none';
     if (detail) detail.style.display = 'block';

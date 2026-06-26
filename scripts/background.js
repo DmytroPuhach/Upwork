@@ -1,4 +1,6 @@
-// OptimizeUp Extension v19.6.3 — Background Service Worker
+// OptimizeUp Extension v19.6.4 — Background Service Worker
+// v19.6.4: maybeReloadUpworkTab skips reload while operatorBusyUntil is in the future (operator
+//   interacting with the panel) — fixes the panel blinking/closing mid-click.
 // v19.6.3: + OPEN_JOB_TAB → chrome.tabs.create (reliable job open; content-script window.open is
 //   blocked on Upwork by CSP/popup rules).
 // v19.6.2: + CANCEL_COVER → leadgen-v2 cancel_cover (mark proposal cancelled after a sent cover).
@@ -247,6 +249,11 @@ async function maybeReloadUpworkTab() {
   try {
     const status = await radarMonitoringStatus();
     if (!status.ok) { console.log(`[OU] reload skip: ${status.reason}`); return; }
+
+    // Don't reload while the operator is interacting with the panel (viewing a card / clicking) —
+    // a reload mid-interaction wipes the page ("blinks and won't open"). content.js sets this.
+    const { operatorBusyUntil } = await chrome.storage.local.get('operatorBusyUntil');
+    if (operatorBusyUntil && Date.now() < operatorBusyUntil) { console.log('[OU] reload skip: operator_busy'); return; }
 
     const { lastReloadAt, nextReloadGapMs } = await chrome.storage.local.get(['lastReloadAt', 'nextReloadGapMs']);
     const gap = nextReloadGapMs || RELOAD_MIN_MS;
