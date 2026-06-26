@@ -1,5 +1,8 @@
 
-// OptimizeUp Extension v18.5.7 — Content Script
+// OptimizeUp Extension v18.5.8 — Content Script
+// v18.5.8: extractScreeningFromPage() — reads screening/additional questions off the open job page
+//   into enrichment.screening_questions (+ strategy telemetry). Cover now answers them human-style
+//   (cover prompt §5b). Backend already persisted/forwarded them; content was sending [].
 // v18.5.7: fix "card on page missing from feed". Root cause: dedup `ou_seen_jobs` outlived the panel
 //   (Clear/reload) → seen.has → skipped render forever. Now `seen` gates FUNNEL ingest only; the panel
 //   re-renders ANY passing on-page card not already in it (toRender by panel membership, not by seen).
@@ -1313,6 +1316,35 @@
     return out;
   }
 
+  // Screening / additional questions straight from the open job page (so the cover can answer them).
+  function extractScreeningFromPage() {
+    const clean = (t) => (t || '').replace(/\s+/g, ' ').trim();
+    const ok = (t) => t.length > 4 && t.length < 400;
+    // 1) known containers
+    const sels = ['[data-test="additional-questions"]', '[data-test="questions"]', '[data-test="AdditionalQuestions"]', 'section[aria-label*="question" i]'];
+    for (const s of sels) {
+      const c = document.querySelector(s);
+      if (!c) continue;
+      const items = [...c.querySelectorAll('li')].map(li => clean(li.textContent)).filter(ok);
+      if (items.length) return { questions: items.slice(0, 20), strategy: 'sel:' + s };
+    }
+    // 2) heading "answer the following questions" → nearest following list
+    const heads = [...document.querySelectorAll('h1,h2,h3,h4,h5,p,div,span,strong,label')];
+    const head = heads.find(el => /answer the following questions/i.test(el.textContent || '') && (el.textContent || '').length < 220);
+    if (head) {
+      let scope = head.closest('section,div') || head.parentElement;
+      for (let hop = 0; hop < 4 && scope; hop++) {
+        const list = scope.querySelector('ol,ul');
+        if (list) {
+          const items = [...list.querySelectorAll('li')].map(li => clean(li.textContent)).filter(ok);
+          if (items.length) return { questions: items.slice(0, 20), strategy: 'heading+list' };
+        }
+        scope = scope.parentElement;
+      }
+    }
+    return { questions: [], strategy: 'none' };
+  }
+
   // On the job-detail page: show the detail panel for THIS job; AI reads the page in place (no tab).
   async function initJobDetailPanel() {
     const key = cardIdFromUrl();
@@ -1326,10 +1358,12 @@
     if (card.match_score == null) {
       const desc = await waitForDescriptionOnPage();
       if (!desc || desc.length < 200) { await patchCard(key, { analyzeError: 'нет описания на странице' }); renderDetail(key); return; }
+      const screening = extractScreeningFromPage();
       const enrichment = {
         ok: true, upwork_job_id: card.upwork_id, url: location.href, title: card.title,
         description: desc, budget_raw: card.budget, skills: Array.isArray(card.skills) ? card.skills : [],
-        screening_questions: [], client: extractClientFromPage(), meta: {},
+        screening_questions: screening.questions, screening_strategy: screening.strategy,
+        client: extractClientFromPage(), meta: {},
       };
       chrome.runtime.sendMessage({ type: 'ANALYZE_FROM_PAGE', payload: {
         upwork_id: card.upwork_id, enrichment, matched_skills: card.matched_skills, total_skills: card.total_skills,

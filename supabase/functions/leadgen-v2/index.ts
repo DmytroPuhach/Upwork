@@ -1,3 +1,5 @@
+// leadgen-v2 v42 — screening answers: tightened COVER_SCHEMA extra_qa to human, 1-2 sentence, Q/A
+//   form (not essay). Pairs with cover_generator_prompt_v3 §5b + content.js extractScreeningFromPage.
 // leadgen-v2 v41 — FIX: sibling-cover block split a surrogate pair (Unicode bold) → Anthropic 400
 //   "no low surrogate" → dima/vika covers failed. Now code-point-safe truncate (safeSlice) + lone-
 //   surrogate scrub (scrubSurr), applied to sibling block AND all TG text cuts.
@@ -78,7 +80,7 @@ Respond with ONE raw JSON object and nothing else (no markdown, no prose, no cod
 Schema:
 {
   "cover": "<complete proposal, 80-150 words, ready to submit — never null/empty/placeholder>",
-  "extra_qa": "<answers to the screening questions as a short text block, or empty string if none>",
+  "extra_qa": "<answer EACH screening question in 1-2 plain first-person sentences as typed into the form (NOT an essay/cover letter); per question: a 'Q: ...' line then an 'A: ...' line, blank line between pairs; empty string if no questions>",
   "risks": "<1-2 short risks for this specific bid, or empty string>"
 }
 Start with { and end with } — raw JSON only.`;
