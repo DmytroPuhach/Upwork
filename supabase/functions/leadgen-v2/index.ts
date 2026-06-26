@@ -1,3 +1,8 @@
+// leadgen-v2 v45 — FIX two output defects (audit flagged but never fixed the text):
+//   (1) unicode-bold STRIPPED from sent/stored cover via NFKC (𝐓𝐨𝐩→Top, 𝟒𝟑𝟕𝐊→437K; emojis kept) +
+//       cover prompt no longer mandates Unicode Bold. Client gets plain text, not garbage.
+//   (2) dima_style_fallback (zero account) now FORBIDS any concrete numbers/metrics/named projects &
+//       skips Proof — stops zero accounts fabricating a track record ("12 to 6 on UK affiliate").
 // leadgen-v2 v44 — cover_voice log now distinguishes own_winners (PROVEN) / descriptive_only /
 //   dima_style_fallback / none, with has_winners flag — so you always see who runs on proven material.
 // leadgen-v2 v43 — per-account VOICE corpus. generate_cover loads {slug}_winner_proposals/
@@ -438,7 +443,7 @@ async function buildVoiceBlock(sb, slug) {
       mode: 'dima_style_fallback',
       has_winners: false,
       loaded: [dmap['dima_winning_cover_letters'] ? 'dima_winning_cover_letters' : 'dima_winner_proposals'],
-      block: `\n\n---\n\n## STYLE TEMPLATE (структура и тон) — это каверы DIMA, НЕ этого аккаунта\nУ «${slug}» нет своих выигравших материалов. Отрази СТРУКТУРУ и ТОН примеров ниже, но НЕ используй статистику, бейдж Top Rated Plus или личные цифры Dima — у этого аккаунта НЕТ трек-рекорда, который можно цитировать. Метрики/кейсы — только агентские из knowledge_base, без личной статистики аккаунта.\n${scrubSurr(safeSlice(src, 3000))}`,
+      block: `\n\n---\n\n## STYLE TEMPLATE (ТОЛЬКО структура и тон) — это каверы DIMA, НЕ этого аккаунта\nУ «${slug}» НЕТ своих выигравших материалов и НЕТ трек-рекорда.\n**ПРАВИЛА (переопределяют блок Proof и любые требования про цифры/кейсы выше):**\n- Бери из примеров ниже ТОЛЬКО структуру и тон.\n- ЗАПРЕЩЕНО: бейдж/статус Top Rated Plus; статистика Dima; ЛЮБЫЕ конкретные результаты и цифры (+X%, "12 to 6", "+200%", €/$ суммы, "increased ... by N", "ranked #1"); названия прошлых клиентов/проектов; формулировки "я сделал/я достиг/в недавнем проекте".\n- Блок Proof (кейс с метриками) ПОЛНОСТЬЮ ПРОПУСТИТЬ.\n- Только ОБЩИЕ формулировки способностей и план первых шагов: "I'd start by auditing...", "I can implement...", "my first move would be...", "here's how I'd approach it...".\n- Метод/подход описывать можно; ДОСТИГНУТЫЙ результат и любые числа — нельзя.\n${scrubSurr(safeSlice(src, 3000))}`,
     };
   }
   return { mode: 'none', has_winners: false, loaded: [], block: '' };
@@ -727,11 +732,17 @@ async function runGenerateCover(jobId, accountSlug, fullText) {
       await dbg(sb, 'cover_claude_error', { run_id: runId, err: result.error, account: account.slug });
       return { ok: false, error: result.error };
     }
-    const cover = (result.cover || '').trim();
+    // STRIP pseudo-bold unicode (Mathematical Alphanumeric, U+1D400-1D7FF) → plain ASCII before
+    // storing/sending. NFKC maps 𝐓𝐨𝐩→Top, 𝟒𝟑𝟕𝐊→437K; emojis untouched. The client must NOT receive
+    // unicode garbage — flagging in audit was never enough, this actually removes it from the sent text.
+    const hadUnicodeBold = /[\u{1D400}-\u{1D7FF}]/u.test(result.cover || '');
+    const cover = (result.cover || '').normalize('NFKC').trim();
     if (cover.length < 50) return { ok: false, error: 'cover too short / empty' };
+    const extraQa = (result.extra_qa || '').normalize('NFKC');
 
     const audit = auditProposal(cover);
-    const hasUnicodeBold = /[\u{1D400}-\u{1D7FF}]/u.test(cover); // REAL detection, not hardcoded
+    const hasUnicodeBold = /[\u{1D400}-\u{1D7FF}]/u.test(cover); // now should be false (stripped above)
+    await dbg(sb, 'cover_normalized', { run_id: runId, account: account.slug, had_unicode_bold: hadUnicodeBold, still_has: hasUnicodeBold });
 
     // match_score from match_scores (written in score_route)
     let matchScore: any = null;
@@ -740,7 +751,7 @@ async function runGenerateCover(jobId, accountSlug, fullText) {
 
     // proposal row (reuse if exists for this job+account)
     let proposalId: string | null = null;
-    const toolsUsed = { extra_qa: result.extra_qa || '', risks: result.risks || '', generator: 'v37' };
+    const toolsUsed = { extra_qa: extraQa, risks: result.risks || '', generator: 'v37' };
     const { data: exP } = await sb.from('proposals').select('id').eq('job_id', jobId).eq('member_slug', account.slug).maybeSingle();
     if (exP) {
       await sb.from('proposals').update({
@@ -775,7 +786,7 @@ async function runGenerateCover(jobId, accountSlug, fullText) {
     }
 
     // Telegram to the owner of this account
-    const tgSent = await sendCoverTg(account, job, cover, result.extra_qa, proposalId);
+    const tgSent = await sendCoverTg(account, job, cover, extraQa, proposalId);
     await dbg(sb, 'cover_done', { run_id: runId, account: account.slug, proposal_id: proposalId, quality: audit.quality_score, tg_sent: tgSent });
     return { ok: true, proposal_id: proposalId, tg_sent: tgSent };
   } catch (err) {

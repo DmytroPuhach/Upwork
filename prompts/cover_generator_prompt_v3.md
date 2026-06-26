@@ -86,22 +86,22 @@
 
 Английский:
 [Эмодзи] Here is what I can do for your project:
-✅ [Действие] → [Результат в Unicode Bold]
-✅ [Действие] → [Результат в Unicode Bold]
-✅ [Действие] → [Результат в Unicode Bold]
+✅ [Действие] → [Результат обычным текстом]
+✅ [Действие] → [Результат обычным текстом]
+✅ [Действие] → [Результат обычным текстом]
 
 Немецкий:
 [Эмодзи] Das biete ich für Ihr Projekt:
-✅ [Aktion] → [Ergebnis in Unicode Bold]
-✅ [Aktion] → [Ergebnis in Unicode Bold]
-✅ [Aktion] → [Ergebnis in Unicode Bold]
+✅ [Aktion] → [Ergebnis as plain text]
+✅ [Aktion] → [Ergebnis as plain text]
+✅ [Aktion] → [Ergebnis as plain text]
 
 ---
 
 ### Блок 4 — Proof (кейс из базы)
 Подбери 1 максимально релевантный кейс из knowledge_base_v3.
 
-[Эмодзи] I recently solved a similar challenge. [Боль — Решение — Метрики в Unicode Bold].
+[Эмодзи] I recently solved a similar challenge. [Боль — Решение — Метрики обычным текстом].
 [Полный кликабельный URL на кейс с новой строки если есть]
 
 ---
@@ -122,11 +122,8 @@ Mit freundlichen Grüßen,
 
 ## 5. КРИТИЧЕСКИЕ ОГРАНИЧЕНИЯ (ANTI-AI FILTER)
 
-**Unicode Bold — обязательно:**
-Выделять через Unicode жирным:
-- Цифры и метрики: €437K, +1400%, 934 conversions
-- Технологии: Shopify, GA4, GTM
-- Статус (только Dima): Top Rated Plus
+**БЕЗ псевдо-жирного юникода — пиши ОБЫЧНЫМ текстом:**
+Upwork-кавер это plain text. НЕ используй математические/юникод-«жирные» символы (𝐓𝐞𝐱𝐭, 𝟒𝟑𝟕𝐊) — клиент видит их как мусор/спам. Пиши обычными буквами и цифрами: Top Rated Plus, 437K, +1400%, Shopify, GA4 — без спецсимволов.
 
 **СТОП-СЛОВА (запрещено использовать):**
 leverage, robust, tailored, comprehensive, delve, beacon, transform, elevate, seamless, ensure, cutting-edge, utilize, holistic, going forward, game-changer, I am excited to apply, I have carefully read your job post, I am confident I can help, look forward to working with you, passionate about, dive deep
