@@ -1,3 +1,7 @@
+// leadgen-v2 v43 — per-account VOICE corpus. generate_cover loads {slug}_winner_proposals/
+//   _winning_cover_letters/_communication_style/_sales_patterns/_proven_techniques from opus_knowledge.
+//   Own winners → real voice; zero account (no winners) → Dima winners as STYLE TEMPLATE only (no
+//   Dima stats/badge); nothing → block skipped + logged (dbg 'cover_voice' mode own|dima_style_fallback|none).
 // leadgen-v2 v42 — screening answers: tightened COVER_SCHEMA extra_qa to human, 1-2 sentence, Q/A
 //   form (not essay). Pairs with cover_generator_prompt_v3 §5b + content.js extractScreeningFromPage.
 // leadgen-v2 v41 — FIX: sibling-cover block split a surrogate pair (Unicode bold) → Anthropic 400
@@ -389,6 +393,52 @@ ${JSON.stringify(accountProfiles, null, 2)}`;
   return await callClaude(system, userMsg, sb, 'score', 2500);
 }
 
+// Per-account VOICE corpus from opus_knowledge.
+//  - own winners present  → load the account's real voice ({slug}_winner_proposals / _winning_cover_letters
+//    / _communication_style / _sales_patterns / _proven_techniques; only the keys that exist).
+//  - no winners (zero account) → Dima's winning examples as a STYLE TEMPLATE ONLY (mirror structure/tone,
+//    NEVER cite Dima's stats/badge — this account has no track record).
+//  - nothing at all → skip the block (never inject empty silently) and log it.
+const VOICE_TYPES = [
+  { t: 'winner_proposals', label: 'Выигравшие proposals (примеры)', cap: 2600, winner: true },
+  { t: 'winning_cover_letters', label: 'Выигравшие каверы (примеры)', cap: 2400, winner: true },
+  { t: 'communication_style', label: 'Стиль коммуникации', cap: 1400 },
+  { t: 'sales_patterns', label: 'Sales-паттерны', cap: 1600 },
+  { t: 'proven_techniques', label: 'Проверенные приёмы', cap: 1200 },
+];
+async function buildVoiceBlock(sb, slug) {
+  const want = VOICE_TYPES.map((x) => `${slug}_${x.t}`);
+  const { data } = await sb.from('opus_knowledge').select('key, content').in('key', want);
+  const map = {};
+  (data || []).forEach((r) => { if (r.content && r.content.trim().length > 40) map[r.key] = r.content; });
+  const present = VOICE_TYPES.filter((x) => map[`${slug}_${x.t}`]);
+
+  if (present.length > 0) {
+    const hasWinners = present.some((x) => x.winner);
+    const parts = present.map((x) => `### ${x.label}\n${scrubSurr(safeSlice(map[`${slug}_${x.t}`], x.cap))}`);
+    return {
+      mode: hasWinners ? 'own' : 'own_no_winners',
+      loaded: present.map((x) => x.t),
+      block: `\n\n---\n\n## ГОЛОС АККАУНТА «${slug}» — РЕАЛЬНЫЕ МАТЕРИАЛЫ ЭТОГО АККАУНТА\nПиши кавер В ЭТОМ голосе/стиле — это собственные материалы аккаунта.\n${parts.join('\n\n')}`,
+    };
+  }
+
+  // Zero account → Dima STYLE template only.
+  const { data: dd } = await sb.from('opus_knowledge').select('key, content')
+    .in('key', ['dima_winning_cover_letters', 'dima_winner_proposals']);
+  const dmap = {};
+  (dd || []).forEach((r) => { if (r.content && r.content.trim().length > 40) dmap[r.key] = r.content; });
+  const src = dmap['dima_winning_cover_letters'] || dmap['dima_winner_proposals'];
+  if (src) {
+    return {
+      mode: 'dima_style_fallback',
+      loaded: [dmap['dima_winning_cover_letters'] ? 'dima_winning_cover_letters' : 'dima_winner_proposals'],
+      block: `\n\n---\n\n## STYLE TEMPLATE (структура и тон) — это каверы DIMA, НЕ этого аккаунта\nУ «${slug}» нет своих выигравших материалов. Отрази СТРУКТУРУ и ТОН примеров ниже, но НЕ используй статистику, бейдж Top Rated Plus или личные цифры Dima — у этого аккаунта НЕТ трек-рекорда, который можно цитировать. Метрики/кейсы — только агентские из knowledge_base, без личной статистики аккаунта.\n${scrubSurr(safeSlice(src, 3000))}`,
+    };
+  }
+  return { mode: 'none', loaded: [], block: '' };
+}
+
 // ENDPOINT B helper: generate ONE cover on full job text. system = cover_generator_prompt_v3 + knowledge_base_v3.
 async function generateCoverClaude(fullText, account, job, sb, siblingCovers: any[] = []) {
   const { data: rows } = await sb.from('opus_knowledge').select('key, content')
@@ -397,9 +447,14 @@ async function generateCoverClaude(fullText, account, job, sb, siblingCovers: an
   const knowledgeBase = rows?.find(r => r.key === 'knowledge_base_v3')?.content;
   if (!coverPrompt) return { error: 'cover_generator_prompt_v3 not found' };
 
-  const system = coverPrompt
+  const baseSystem = coverPrompt
     + (knowledgeBase ? `\n\n---\n\n## AGENCY KNOWLEDGE BASE\n${knowledgeBase.substring(0, 7000)}` : '')
     + `\n\n---\n\n${COVER_SCHEMA}`;
+
+  // Per-account voice: own corpus, or Dima STYLE fallback, or nothing (logged, never empty-injected).
+  const voice = await buildVoiceBlock(sb, account.slug);
+  await dbg(sb, 'cover_voice', { account: account.slug, mode: voice.mode, loaded: voice.loaded });
+  const system = baseSystem + voice.block;
 
   const profile = {
     account_slug: account.slug,
