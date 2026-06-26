@@ -1,5 +1,8 @@
 
-// OptimizeUp Extension v18.5.5 — Content Script
+// OptimizeUp Extension v18.5.6 — Content Script
+// v18.5.6: radar panel tied to scrapingActive. Start → panel shows; Stop → panel closes (any page,
+//   incl. profile via SPA). handleJobCards no-ops when scraping is OFF (no scraping without Start).
+//   Fixes "panel hangs/catches even though Start wasn't pressed".
 // v18.5.5: AI verdict = skip / no account fit → card auto-marked skipped (struck + sinks), no manual
 //   ✕ needed. Detail shows the verdict in red with ❌. (Sent cards are never auto-skipped.)
 // v18.5.4: feed number == sort key (single rank). Shown number now ALWAYS matches top→down order
@@ -758,7 +761,8 @@
     if (jobsInFlight) return;
     if (!/\/nx\/(search\/jobs|find-work)/.test(location.pathname)) return;
 
-    const { cachedIdentity } = await chrome.storage.local.get('cachedIdentity');
+    const { cachedIdentity, scrapingActive } = await chrome.storage.local.get(['cachedIdentity', 'scrapingActive']);
+    if (!scrapingActive) return;   // radar OFF → don't scrape (Start scraping gates the radar)
     if (!cachedIdentity?.member?.is_bidding_enabled) return;
 
     jobsInFlight = true;
@@ -1342,8 +1346,17 @@
     if (currentDetailKey === key) renderDetail(key);
   }
 
+  // Radar panel is tied to scraping state: Stop scraping → close it, Start → show it.
+  function removePanel() {
+    currentDetailKey = null;
+    const p = document.getElementById(PANEL_ID);
+    if (p) p.remove();
+  }
+
   async function restorePanel() {
     if (getPageType() !== 'jobs_search') return;
+    const { scrapingActive } = await chrome.storage.local.get('scrapingActive');
+    if (!scrapingActive) { removePanel(); return; }   // radar OFF → no panel
     ensurePanel();
     updatePanelStats();
     showList();
@@ -1355,6 +1368,16 @@
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg?.type === 'PANEL_CARD' && msg.payload) {
       try { upsertScored(msg.payload); } catch (e) { warn('panel update fail:', e?.message); }
+    }
+  });
+
+  // React to Start/Stop scraping (toggled from the popup → chrome.storage.local.scrapingActive).
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local' || !changes.scrapingActive) return;
+    if (changes.scrapingActive.newValue) {
+      if (getPageType() === 'jobs_search') restorePanel().catch(() => {});
+    } else {
+      removePanel();   // Stop → close the radar panel on ANY page (incl. profile via SPA nav)
     }
   });
 
